@@ -13,6 +13,23 @@ Redmi G Pro 27U 2026显示器 ADB 控制工具
 <img src="assets/Screensettings.png" width="500">
 <img src="assets/Gamesettings.png" width="500">
 
+## macOS 版
+
+`macos/` 下有一份**原生 SwiftUI 移植**，功能与原版对齐，另外多了些 macOS 独有的能力：
+
+```bash
+cd macos
+./build_app.sh          # 打包成自包含的 .app（Intel + Apple Silicon 通用）
+open MimonitorToolbox.app
+```
+
+- **菜单栏常驻**：不在 Dock，顶栏图标下拉即可快捷调节（画面模式 / 精密控光 / 背光…，可自定义）
+- **全局快捷键**：自带悬浮提示与可调倒计时
+- **无需任何依赖**：adb 会自动下载并内嵌进 .app，最终用户双击即用
+- 自动适配深色 / 浅色模式
+
+详情与构建说明见 [`macos/README.md`](macos/README.md)。
+
 ## 实现原理
 
 通过无线 ADB 连接到显示器内置的 Android 系统，利用 `settings` 命令和 MTK 平台 JNI 接口（`MtkDirectTool.jar`）直接读写硬件寄存器，实现对显示器各项参数的精确控制。

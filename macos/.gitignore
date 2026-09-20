@@ -1,0 +1,11 @@
+# SPM 构建产物
+.build/
+
+# build_app.sh 下载并缓存的 platform-tools（约 15MB，不必入库）
+.cache/
+
+# 打包产物
+*.app
+
+# macOS 元数据
+.DS_Store
