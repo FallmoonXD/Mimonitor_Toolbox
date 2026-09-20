@@ -20,6 +20,10 @@ on:
     paths:
       - 'macos/**'
       - '.github/workflows/macos.yml'
+  # 手动触发：Actions 页面点「Run workflow」，可选任意分支或标签。
+  # 注意选标签时，用的是**那个标签里**的工作流文件 —— 老标签如果本身就是坏的，
+  # 手动跑同样会失败，这时选 master 拿产物即可。
+  workflow_dispatch:
 
 permissions:
   contents: read

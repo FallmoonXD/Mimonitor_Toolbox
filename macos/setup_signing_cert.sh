@@ -14,9 +14,14 @@ set -euo pipefail
 CERT_NAME="MimonitorToolbox Local Signing"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
-if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$CERT_NAME"; then
+# 不要写成 `security ... | grep -q "$CERT_NAME"`：脚本开了 pipefail，
+# grep -q 匹配到就立刻退出，写端（security）可能收到 SIGPIPE 返回非零，
+# 整条管道被判失败 —— 结果是「证书明明在，却报不存在」，然后重复创建一张。
+# 改成先把输出收进变量，再用 shell 自己的字符串匹配判断。
+EXISTING_ID="$(security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null || true)"
+if [[ "$EXISTING_ID" == *"$CERT_NAME"* ]]; then
     echo "✅ 证书已存在，无需重建：$CERT_NAME"
-    security find-identity -v -p codesigning "$KEYCHAIN" | grep "$CERT_NAME"
+    printf '%s\n' "$EXISTING_ID" | grep "$CERT_NAME"
     exit 0
 fi
 
@@ -46,10 +51,11 @@ security add-trusted-cert -r trustRoot -k "$KEYCHAIN" "$TMP/cert.pem" 2>/dev/nul
     echo "    ⚠️ 自动添加信任失败，请手动打开「钥匙串访问」，双击该证书，把「代码签名」设为「始终信任」"
 
 echo "==> 4/4 校验..."
-if security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "$CERT_NAME"; then
+VALID_ID="$(security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null || true)"
+if [[ "$VALID_ID" == *"$CERT_NAME"* ]]; then
     echo ""
     echo "✅ 完成！证书已就绪："
-    security find-identity -v -p codesigning "$KEYCHAIN" | grep "$CERT_NAME"
+    printf '%s\n' "$VALID_ID" | grep "$CERT_NAME"
     echo ""
     echo "接下来重新打包：./build_app.sh"
     echo "（首次签名时 macOS 可能弹窗问是否允许 codesign 使用密钥，点「始终允许」即可）"

@@ -24,8 +24,10 @@ REPO_ROOT="$(cd .. && pwd)"
 
 PLATFORM_TOOLS_URL="https://dl.google.com/android/repository/platform-tools-latest-darwin.zip"
 
-# 由 ./setup_signing_cert.sh 创建的固定签名身份名
-SIGN_CERT_NAME="MimonitorToolbox Local Signing"
+# 由 ./setup_signing_cert.sh 创建的固定签名身份名。
+# 允许外部覆盖，方便模拟「本机没装证书」的情况（CI 就是这样）：
+#   SIGN_CERT_NAME="不存在" ./build_app.sh
+SIGN_CERT_NAME="${SIGN_CERT_NAME:-MimonitorToolbox Local Signing}"
 
 # ---------- 获取 adb 二进制 ----------
 # stdout 只输出 adb 路径，过程信息走 stderr，方便调用方捕获。
@@ -178,8 +180,13 @@ fi
 
 # 优先用固定身份的自签名证书。macOS 的「本地网络」权限要求稳定的代码身份才能记住授权，
 # ad-hoc 签名的身份是内容哈希、每次编译都变，会导致局域网访问被静默拒绝。
+#
+# 末尾的 `|| true` 不能省：脚本开了 `set -euo pipefail`，找不到证书时
+# `grep -m1` 返回 1，会让整条管道失败、进而让这个赋值失败、脚本直接中止。
+# CI 上本来就没有证书（只存在于本机钥匙串），所以这个分支必然走到 ——
+# 本地因为证书在，grep 总能匹配，反而测不出来。
 SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
-    | grep -m1 "$SIGN_CERT_NAME" | sed -E 's/^[^"]*"([^"]*)".*/\1/')"
+    | grep -m1 "$SIGN_CERT_NAME" | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true)"
 if [ -n "$SIGN_ID" ]; then
     if codesign --force --sign "$SIGN_ID" "$APP_DIR" 2>/dev/null; then
         echo "    已用固定证书签名：$SIGN_ID"
