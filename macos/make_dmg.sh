@@ -8,13 +8,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # 和 build_app.sh 保持一致：APP_NAME 是 .app 的目录名（可中文），
-# EXEC_NAME 是包内可执行文件名（固定，跟 Package.swift 一致）。
+# EXEC_NAME 是包内可执行文件名（固定，跟 Package.swift 一致），
+# PACKAGE_NAME 是 DMG 文件名（必须 ASCII，见 build_app.sh 里的说明）。
 APP_NAME="红米G Pro ToolBox"
 EXEC_NAME="MimonitorToolbox"
+PACKAGE_NAME="MimonitorToolbox-macos"
 SRC_APP="$APP_NAME.app"
-OUT_DMG="$APP_NAME.dmg"
-# 卷标和 app 同名 —— 挂载后 /Volumes/红米G Pro ToolBox/红米G Pro ToolBox.app，
-# 这是 macOS 分发 DMG 的惯例
+OUT_DMG="$PACKAGE_NAME.dmg"
+# 卷标用产品名（中文没问题 —— 被 GitHub 改写的是**文件名**，卷标不经过它）。
+# 挂载后是 /Volumes/红米G Pro ToolBox/红米G Pro ToolBox.app
 VOL_NAME="$APP_NAME"
 
 # ${SRC_APP} 的大括号不能省：后面紧跟全角逗号，bash 会把它吃进变量名

@@ -190,17 +190,32 @@ jobs:
 
       # build_app.sh 最后一步已经生成 DMG，这里再补一个 zip：
       # DMG 给普通用户（挂载后拖进 Applications），zip 给习惯解压的人。
+      # 分发包用 ASCII 名（MimonitorToolbox-macos.zip），但里面装的仍是
+      # 中文名的 .app —— GitHub Release 会改写非 ASCII 的**文件名**，
+      # 实测「红米G Pro ToolBox.dmg」上传后变成「G.Pro.ToolBox.dmg」。
       - name: 补一个 zip（ditto 保留符号链接与权限）
         working-directory: macos
-        run: ditto -c -k --sequesterRsrc --keepParent "红米G Pro ToolBox.app" "红米G Pro ToolBox.zip"
+        run: |
+          set -euo pipefail
+          test -d "红米G Pro ToolBox.app" || { echo "❌ 缺 .app"; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "红米G Pro ToolBox.app" "MimonitorToolbox-macos.zip"
 
       - name: 确认分发包都在
         working-directory: macos
         run: |
           set -euo pipefail
-          test -f "红米G Pro ToolBox.dmg" || { echo "缺 DMG"; exit 1; }
-          test -f "红米G Pro ToolBox.zip" || { echo "缺 zip"; exit 1; }
-          ls -lh "红米G Pro ToolBox.dmg" "红米G Pro ToolBox.zip"
+          test -f "MimonitorToolbox-macos.dmg" || { echo "缺 DMG"; exit 1; }
+          test -f "MimonitorToolbox-macos.zip" || { echo "缺 zip"; exit 1; }
+          # 分发文件名必须只含 [A-Za-z0-9._-]，否则 GitHub 上传时会改写它：
+          # 实测「红米G Pro ToolBox.dmg」变成了「G.Pro.ToolBox.dmg」
+          # （中文被剥掉、空格还变成了点）。白名单比「排除非 ASCII」严 ——
+          # 空格是 ASCII，但照样会被 GitHub 换掉。
+          for f in MimonitorToolbox-macos.dmg MimonitorToolbox-macos.zip; do
+            case "$f" in
+              *[!A-Za-z0-9._-]*) echo "❌ $f 含 GitHub 会改写的字符"; exit 1 ;;
+            esac
+          done
+          ls -lh MimonitorToolbox-macos.dmg MimonitorToolbox-macos.zip
 
       # path 用通配符而不是写死文件名：文件名带空格和中文，
       # upload-artifact 内部走 glob 匹配，写死容易在空格上翻车。

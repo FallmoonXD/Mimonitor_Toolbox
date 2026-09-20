@@ -2,7 +2,8 @@
 # 打包为可直接分发的 .app（无需 Xcode，仅需命令行工具里的 swift）
 #
 # 用法：  cd macos && ./build_app.sh
-# 产物：  macos/红米G Pro ToolBox.app  +  macos/红米G Pro ToolBox.dmg
+# 产物：  macos/红米G Pro ToolBox.app（app 用中文名）
+#         macos/MimonitorToolbox-macos.dmg（分发文件用 ASCII 名，见 PACKAGE_NAME）
 #
 # 所有运行时资源都会被内嵌进 .app，最终用户无需安装任何东西（不需要 brew / adb）：
 #   - adb      : 优先用仓库 assets/runtime/adb；没有就自动从 Google 官方下载 platform-tools 并缓存
@@ -21,6 +22,12 @@ APP_NAME="红米G Pro ToolBox"
 # 不用动它。系统记录的「进程名」也取自这里（Activity Monitor / System Events
 # 里看到的仍是 MimonitorToolbox）。
 EXEC_NAME="MimonitorToolbox"
+
+# 分发文件（DMG / zip）的名字 —— **必须是 ASCII**。
+# GitHub Release 会把非 ASCII 的文件名改写掉：实测 `红米G Pro ToolBox.dmg`
+# 上传后变成了 `G.Pro.ToolBox.dmg`（中文被剥掉、空格变点），用户看到的
+# 是个残缺名字。包内的 .app 不受影响，仍然是「红米G Pro ToolBox.app」。
+PACKAGE_NAME="MimonitorToolbox-macos"
 
 BUILD_DIR=".build"   # swift 的中间产物，隐藏目录
 CACHE_DIR=".cache"   # platform-tools 下载缓存，隐藏目录
@@ -215,7 +222,7 @@ fi
 # 顺手打个 DMG（拖进 Applications 即安装，macOS 上最常见的分发方式）。
 # 失败不影响 .app 本身，所以只警告不中断。
 echo "==> 6/6 打包 DMG（可拖动安装）..."
-DMG_NAME="$APP_NAME.dmg"
+DMG_NAME="$PACKAGE_NAME.dmg"
 if ./make_dmg.sh >/dev/null 2>&1; then
     # 必须写 ${DMG_NAME} —— bash 在 UTF-8 locale 下会把紧跟其后的全角「（」
     # 当成变量名的一部分，`$DMG_NAME（` 会变成 `DMG_NAME（: unbound variable`。
