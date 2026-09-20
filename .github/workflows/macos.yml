@@ -38,6 +38,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 这个坑在本项目已经踩了五次（$DMG_NAME（、$LSUI（ …）。
+      # bash 在 UTF-8 locale 下会把紧跟变量之后的全角标点当成变量名的一部分，
+      # 而脚本都开了 set -u，于是直接 `xxx（: unbound variable` 中止 ——
+      # 前面所有步骤都过了，最后一步倒在一条 echo 上。
+      #
+      # 之前靠人工 grep 自查，但范围只写了 macos/*.sh，**漏掉 workflow 自己的
+      # run: 块**（那里也是 shell），结果 $LSUI（ 又漏过去了。
+      # 放进 CI 就不会再漏。
+      - name: 自查 shell 中文变量陷阱
+        run: |
+          set -euo pipefail
+          # ^[^#]* 用来跳过注释行（说明这个坑本身的注释里就带着示例）
+          BAD=$(grep -rnP '^[^#]*\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' \
+                  macos/*.sh .github/workflows/*.yml 2>/dev/null || true)
+          if [ -n "$BAD" ]; then
+            echo "❌ 变量后面紧跟中文/全角字符，必须写成 \${VAR}："
+            printf '%s\n' "$BAD"
+            exit 1
+          fi
+          echo "✅ 没有变量名被中文吞掉的地方"
+
       - name: 工具链版本
         run: |
           swift --version
@@ -46,6 +67,56 @@ jobs:
       - name: 编译（debug，先过一遍语法检查）
         working-directory: macos
         run: swift build
+
+      # 把发布用的自签名证书从 Secrets 导进来。
+      #
+      # 为什么必须做：没有证书时 build_app.sh 会回退 ad-hoc 签名，而 ad-hoc 的
+      # 身份是文件内容哈希、每次都不同，macOS 的「本地网络」权限认不出它，
+      # 会**静默拒绝** —— 发布出去的包在别人机器上搜不到显示器。
+      #
+      # 没配 Secrets 时（比如 fork 提的 PR）跳过，只警告不失败：那种构建本来就
+      # 只用于验证能不能编译。
+      - name: 导入签名证书
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ] || [ -z "${CERT_PW:-}" ]; then
+            echo "::warning::未配置 MACOS_CERT_P12 / MACOS_CERT_PASSWORD，本次构建回退 ad-hoc 签名（这种包在别人机器上无法授权本地网络）"
+            echo "SIGNED_WITH_CERT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KPW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+
+          # 注意 base64 --decode 而不是 -d：macOS 的 base64 把 -d 当别的东西
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PW" \
+              -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+
+          # 省了这条 codesign 会弹 GUI 授权框，在 CI 上等于永久挂起
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+              -s -k "$KPW" "$KEYCHAIN" >/dev/null
+
+          # 自签名证书默认「不受信任」，而不受信任就不算有效签名身份 ——
+          # `security find-identity -v` 里看不到它，build_app.sh 照样回退 ad-hoc。
+          # runner 是一次性的，加进系统钥匙串即可，不用清理。
+          openssl pkcs12 -in "$RUNNER_TEMP/cert.p12" -clcerts -nokeys \
+              -passin "pass:$CERT_PW" -out "$RUNNER_TEMP/cert.pem" 2>/dev/null
+          sudo security add-trusted-cert -d -r trustRoot \
+              -k /Library/Keychains/System.keychain "$RUNNER_TEMP/cert.pem"
+
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/cert.pem"
+
+          echo "已导入的签名身份："
+          security find-identity -v -p codesigning | grep "MimonitorToolbox" | sed 's/^/  /'
+          echo "SIGNED_WITH_CERT=1" >> "$GITHUB_ENV"
 
       - name: 打包 .app（通用二进制）
         working-directory: macos
@@ -67,8 +138,15 @@ jobs:
           test -f "$R/runtime/ColorfulLedTool.jar"   || { echo "缺 ColorfulLedTool.jar"; exit 1; }
           test -f "$R/adb_guardian/adbguardian-signed.apk" || { echo "缺保活 apk"; exit 1; }
           test -f "$R/AppIcon.icns"   || { echo "缺应用图标"; exit 1; }
-          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")" = "true" \
-              || { echo "未设置 LSUIElement（会在 Dock 常驻）"; exit 1; }
+          # LSUIElement 必须**不是** true：设了会变成「后台型 app」，
+          # 启动台 / Dock / Cmd+Tab 全看不到，用户装完找不到入口。
+          # 菜单栏常驻 + 关窗后收起 Dock 图标由运行时的 DockVisibility 负责。
+          # PlistBuddy 读不到这个键会返回非零，这里兜一下。
+          LSUI=$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist" 2>/dev/null || echo "未设置")
+          [ "$LSUI" != "true" ] || { echo "❌ LSUIElement=true 会让 app 在启动台和 Dock 里消失"; exit 1; }
+          # ${LSUI} 的大括号不能省：后面紧跟全角「（」，bash 在 UTF-8 locale 下
+          # 会把它吃进变量名，报 `LSUI（: unbound variable`，set -u 直接中止。
+          echo "LSUIElement: ${LSUI}（应为「未设置」）"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP/Contents/Info.plist")" = "AppIcon" \
               || { echo "Info.plist 未引用图标"; exit 1; }
           iconutil -c iconset "$R/AppIcon.icns" -o /tmp/iconcheck.iconset \
@@ -86,6 +164,21 @@ jobs:
               || { echo "不是通用二进制"; exit 1; }
 
           codesign --verify --strict "$APP" || { echo "签名校验失败"; exit 1; }
+
+          # 导了证书就必须真的用上。否则发布包带着 ad-hoc 身份出去，
+          # 别人装完搜不到显示器 —— TCC 的「本地网络」权限认不出 ad-hoc 身份，
+          # 会静默拒绝，而且界面上什么提示都没有，极难排查。
+          # 用 case 而不是 `| grep -q`：脚本开了 pipefail，管道写法会误判。
+          SIGN_INFO=$(codesign -dv "$APP" 2>&1)
+          if [ "${SIGNED_WITH_CERT:-0}" = "1" ]; then
+            case "$SIGN_INFO" in
+              *"Signature=adhoc"*)
+                echo "❌ 已导入证书，但产物仍是 ad-hoc 签名"; exit 1 ;;
+            esac
+            echo "✅ 已用固定证书签名"
+          else
+            echo "⚠️ ad-hoc 签名（本次未配置证书，只适合验证编译）"
+          fi
 
           echo "本地网络权限声明: $(/usr/libexec/PlistBuddy -c 'Print :NSLocalNetworkUsageDescription' "$APP/Contents/Info.plist")"
 

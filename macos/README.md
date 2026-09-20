@@ -83,11 +83,27 @@ open "红米G Pro ToolBox.app"
 
 ### 分发注意（Gatekeeper）
 
-当前是 **ad-hoc 签名**，没有 Apple 公证。别人通过微信/网盘拿到 zip 解压后，
-macOS 会打上隔离属性并提示「无法验证开发者」，需要对方在
-**系统设置 → 隐私与安全性** 里点「仍要打开」一次（或右键 .app → 打开）。
+用 `setup_signing_cert.sh` 建的**自签名证书**签名（不是 ad-hoc），但没有 Apple 公证。
+别人拿到 DMG / zip 后，macOS 会打上隔离属性并提示「无法验证开发者」，
+需要对方在 **系统设置 → 隐私与安全性** 里点「仍要打开」一次。
 
-要彻底消除这个提示，需要 Apple Developer Program（$99/年）：用它做 Developer ID 签名 +
+**为什么必须用固定证书而不是 ad-hoc**：macOS 15 起访问局域网需要「本地网络」权限，
+而系统要靠**稳定的代码身份**才能记住授权。ad-hoc 的身份是文件内容哈希、每次编译都变，
+系统认不出，于是直接**静默拒绝**（连弹窗都不给）—— 表现是「连不上、也搜不到显示器」，
+界面上没有任何提示，极难排查。固定证书的身份是「bundle id + 证书指纹」，跨编译稳定。
+
+**CI 上也必须有这张证书**，否则 runner 走 ad-hoc 分支，发出去的包等于不能用：
+
+```bash
+./export_signing_cert.sh --write    # 导出并写进 GitHub Secrets（需 gh 已登录）
+./export_signing_cert.sh            # 只导出，打印需要手动跑的命令
+```
+
+要两个 Secret：`MACOS_CERT_P12`（base64 的 p12）和 `MACOS_CERT_PASSWORD`。
+没配置时 CI 打警告并回退 ad-hoc（fork 提的 PR 走这条路）；
+但**校验步骤会在「配了证书却仍打出 ad-hoc 包」时直接失败**，避免带病发版。
+
+要彻底消除 Gatekeeper 提示，需要 Apple Developer Program（$99/年）：Developer ID 签名 +
 公证（notarytool），之后双击即可打开。脚本里的签名步骤替换成你的证书即可，其余不变。
 
 ## 首次使用注意
@@ -147,7 +163,7 @@ macos/
 
 | 能力 | 说明 |
 | --- | --- |
-| **菜单栏常驻** | `LSUIElement`，不进 Dock；关掉窗口应用继续在后台跑 |
+| **菜单栏常驻 + Dock 图标按需显隐** | 普通 app 身份（启动台能找到），关掉窗口后 Dock 图标收起、只留顶栏 |
 | **菜单栏快捷项**（「菜单栏」页） | 自选把哪些控制放进顶栏下拉：画面模式 / 精密控光 / 色域 / 色温 / 背光… 支持拖动排序 |
 | **菜单栏面板** | 顶栏图标下拉是 `.window` 样式的面板 —— 选项型是下拉、数值型是真滑块，不用开主窗口就能调 |
 | **悬浮提示（HUD）** | 按快捷键时屏幕底部弹出，带倒计时进度条 |
@@ -265,18 +281,39 @@ EDID / FreeSync 这类会改变显示器输入信号格式（可能黑屏或改�
 > 加选项时容易只接上 `@AppStorage` 就以为完事，实际没有任何地方读它。
 > 现在的做法是：存储 + 在启动与变更处各应用一次。
 
-## 菜单栏常驻
+## 菜单栏常驻与 Dock 图标
 
-Info.plist 里 `LSUIElement = true`，应用**不进 Dock**，只在顶栏菜单栏常驻一个显示器图标
-（对应原版 Windows 的托盘图标）。
+应用**不设 `LSUIElement`** —— 保持普通 app 身份，启动台和 Dock 都认得它。
+Dock 图标的显隐由 `DockVisibility`（`App.swift`）在运行时按「有没有可见窗口」切换：
+
+| 状态 | 激活策略 | 表现 |
+| --- | --- | --- |
+| 主窗口开着 | `.regular` | Dock 里有图标，Cmd+Tab 能切 |
+| 关掉主窗口 | `.accessory` | Dock 图标收起，只留顶栏图标，进程继续跑 |
+
+既保住「关掉窗口就退回菜单栏」的行为，又不会在启动台里找不到入口 ——
+WPS 那类「Dock 也有、菜单栏也有」的软件就是这么做的。
 
 菜单内容：连接状态 / 显示主窗口 / 断开或重新连接 / 退出。
-
-因为没有 Dock 图标，**菜单栏是唤回主窗口的唯一入口**；关掉窗口应用不会退出，
-继续在后台跑（快捷键、HDR 记忆、保活守护都还在工作）。
+关掉窗口后应用不会退出，继续在后台跑（快捷键、HDR 记忆、保活守护都还在工作）。
 
 「窗口关闭行为」选项由 `AppDelegate.applicationShouldTerminateAfterLastWindowClosed`
 落地：选「退出应用」才会在关窗时结束进程。
+
+> **踩过的坑（一）**：这里一开始写的是 `LSUIElement = true`，把「不在 Dock 常驻」
+> 理解成了「永远不进 Dock」。那样会被注册成**后台型 app**，启动台 / Dock /
+> Cmd+Tab / 强制退出列表全都看不到 —— 用户从 DMG 拖进 Applications 之后
+> 根本找不到入口。`常驻 ≠ 永不出现`。
+
+> **踩过的坑（二）**：判定「有没有可见窗口」不能只写 `isVisible && !(is NSPanel)`。
+> **菜单栏图标自己也是一个可见窗口**（`NSStatusBarWindow`，不是 NSPanel），
+> 会被算进来，于是永远判定「还有窗口」，关掉主窗口 Dock 图标也不消失。
+> 改成认标题栏（`styleMask.contains(.titled)`）才对 —— 主窗口有标题栏，
+> 菜单栏图标窗口和悬浮提示窗都没有，而且全是公开 API，
+> 不必去引用 `NSStatusBarWindow` 这种私有类名。
+>
+> 排查这条时还顺带发现 `log show` 在这台机器上抓不到任何进程日志
+> （拿 Finder 校准也是 0 行），最后是把决策写进 `/tmp/*.log` 文件才看到真相的。
 
 > 图标用 SF Symbol `display` 而不是应用图标 —— 菜单栏图标惯例是单色符号，
 > 彩色图标混在 Wi-Fi / 电池那一排里会很突兀。
@@ -310,7 +347,20 @@ Windows 图标更新后重跑一次即可。脚本把 `.ico` 的各尺寸图层�
 内嵌的 adb 真的能跑起来。
 
 > CI runner 自带完整 Xcode，所以交叉编译 x86_64 没问题；本机只有命令行工具时也能编
-> （实测可以，见上文）。签名那步在 CI 上走 ad-hoc 分支 —— 固定证书只在本机钥匙串里。
+> （实测可以，见上文）。
+
+签名分两种情况：
+
+- **配了 `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD`**（正式发版）：构建前把固定证书
+  导进临时钥匙串并加入信任，产物有稳定身份，别人装完才能正常授权本地网络。
+  校验步骤会确认产物**不是** ad-hoc 签名。
+- **没配**（fork 提的 PR）：回退 ad-hoc，只用于验证能不能编译，不要拿去分发。
+
+导入证书有几处容易漏，都写在 workflow 的注释里：`security set-key-partition-list`
+（不设 codesign 会弹 GUI 授权框、CI 上等于永久挂起）、
+`security add-trusted-cert`（自签名默认不受信任，不受信任就不算有效身份，
+`find-identity -v` 里看不到）、以及 p12 的密码必须是**导出时那个**
+（曾经把另一个密码写进 Secret，报 `MAC verification failed during PKCS12 import`）。
 
 ## 全局快捷键
 

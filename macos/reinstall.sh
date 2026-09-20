@@ -63,7 +63,7 @@ open -a "$DEST_APP"
 sleep 3
 
 if pgrep -f "$DEST_APP/Contents/MacOS" >/dev/null 2>&1; then
-    echo "    ✅ 已启动（菜单栏常驻，不在 Dock）"
+    echo "    ✅ 已启动（窗口开着时 Dock 里有图标；关掉窗口会收起，只留菜单栏）"
 else
     echo "    ⚠️ 进程未检测到，稍等几秒再看看"
 fi

@@ -24,14 +24,88 @@ enum AppTheme {
     static func applyCurrent() { apply(current) }
 }
 
+/// Dock 图标的显隐。
+///
+/// Info.plist 里**不要**写 `LSUIElement=true`。那个键把 app 注册成「后台型」，
+/// 启动台、Dock、Cmd+Tab、强制退出列表全都看不到它 —— 用户从 DMG 拖进
+/// Applications 之后在启动台里根本找不到入口。（踩过：一开始按「不在 Dock
+/// 常驻」把 LSUIElement 设成了 true，等于理解成了「永远不进 Dock」。）
+///
+/// 正确做法是保持普通 app 身份，再按「有没有可见窗口」在运行时切显示策略。
+/// WPS 那类「Dock 里也有、菜单栏也有」的软件就是这么做的：
+///
+///   有窗口 → .regular    Dock 出现图标，Cmd+Tab 能切
+///   没窗口 → .accessory  Dock 图标消失，只留菜单栏图标继续常驻
+///
+/// 于是「关掉窗口就退回菜单栏」的行为保住了，同时又能在启动台里找到。
+enum DockVisibility {
+    private static var observers: [NSObjectProtocol] = []
+
+    static func startMonitoring() {
+        // 悬浮提示窗（HUDWindow）和菜单栏下拉面板都是 NSPanel，属于辅助窗口。
+        // 它们每次弹出 / 收起都会发这些通知 —— 不排除掉的话，按一下快捷键
+        // Dock 图标就会跟着闪一下。
+        let names: [Notification.Name] = [
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+            NSWindow.willCloseNotification,
+        ]
+        observers = names.map { name in
+            NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { note in
+                guard !(note.object is NSPanel) else { return }
+                // 必须延到下一轮 runloop 再算：willClose 是在窗口**真正隐藏之前**
+                // 发出的，此刻遍历 NSApp.windows 它还是 isVisible == true，
+                // 于是判定成「还有可见窗口」不切换 —— 而关窗后再没有别的通知进来，
+                // 结果就是关掉窗口 Dock 图标永远不消失（实测踩到过）。
+                DispatchQueue.main.async { refresh() }
+            }
+        }
+        refresh()
+    }
+
+    /// 主窗口即将显示前先切回 .regular。等 didBecomeKey 再切的话，
+    /// 窗口已经画出来但 Dock 图标还慢半拍。
+    static func showDockIcon() {
+        guard NSApp.activationPolicy() != .regular else { return }
+        NSApp.setActivationPolicy(.regular)
+    }
+
+    /// 判定「有没有真正的主窗口」。
+    ///
+    /// 不能只写 `isVisible && !(is NSPanel)`：**菜单栏图标自己也是一个可见窗口**
+    /// （NSStatusBarWindow），它不是 NSPanel，于是会被算进来 —— 结果永远是
+    /// 「还有窗口」，Dock 图标关掉窗口也不消失（实测踩到过，日志里能看到
+    /// `wins=[AppKitWindow:hid NSStatusBarWindow:vis]`）。
+    ///
+    /// 改成认标题栏：主窗口有 `.titled`，菜单栏图标窗口和悬浮提示窗都没有。
+    /// 全是公开 API，不依赖 NSStatusBarWindow 这种私有类名。
+    private static func hasMainWindow() -> Bool {
+        NSApp.windows.contains {
+            $0.isVisible && $0.styleMask.contains(.titled) && !($0 is NSPanel)
+        }
+    }
+
+    private static func refresh() {
+        let hasVisibleWindow = hasMainWindow()
+        let want: NSApplication.ActivationPolicy = hasVisibleWindow ? .regular : .accessory
+        guard NSApp.activationPolicy() != want else { return }
+        NSApp.setActivationPolicy(want)
+    }
+}
+
 /// 窗口关闭行为（对应工具页里的「窗口关闭行为」选项，与原版一致）：
 ///   - tray：关掉窗口只是隐藏，应用继续驻留在菜单栏
 ///   - exit：关掉窗口直接退出
-/// 由 Info.plist 的 LSUIElement 让应用不出现在 Dock，所以「隐藏窗口」不会顺带退出。
+/// 「隐藏窗口」不会顺带退出 —— 见 DockVisibility：没窗口时应用退回 .accessory
+/// 策略，菜单栏图标还在，所以进程继续活着。
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 启动时先把主题应用上，否则会先闪一下系统外观再切换
         AppTheme.applyCurrent()
+        DockVisibility.startMonitoring()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -63,7 +137,8 @@ struct MimonitorToolboxApp: App {
             CommandGroup(replacing: .sidebar) { }
         }
 
-        // 菜单栏图标（顶栏状态栏）。应用是 LSUIElement，不在 Dock 常驻。
+        // 菜单栏图标（顶栏状态栏）。Dock 图标的显隐见 DockVisibility ——
+        // 有窗口时在 Dock，关掉窗口只剩这里。
         // 用 .window 样式而不是默认的 .menu：菜单里放不了滑块，
         // 而数值型条目（背光、对比度…）按步长加加减减太难用。
         MenuBarExtra {
@@ -127,6 +202,9 @@ private struct MenuBarPanel: View {
 
             HStack(spacing: 8) {
                 Button("显示主窗口") {
+                    // 先切回 .regular 再开窗：此时应用可能正处于 .accessory
+                    // （Dock 里没有图标），不先切的话窗口能开出来但 Dock 图标要等一拍
+                    DockVisibility.showDockIcon()
                     openWindow(id: "main")
                     NSApp.activate(ignoringOtherApps: true)
                 }

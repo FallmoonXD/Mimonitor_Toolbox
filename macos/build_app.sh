@@ -164,9 +164,12 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
-    <!-- 只在菜单栏常驻，不进 Dock（对应原版的托盘图标行为） -->
-    <key>LSUIElement</key>
-    <true/>
+    <!-- 这里**故意不设** LSUIElement。
+         设成 true 会把 app 注册成「后台型」，启动台 / Dock / Cmd+Tab / 强制退出
+         全都看不到它 —— 用户从 DMG 拖进 Applications 后在启动台里找不到入口。
+         「菜单栏常驻 + 关掉窗口后 Dock 图标消失」改由 DockVisibility
+         （App.swift）在运行时按「有没有可见窗口」切 .regular / .accessory 实现。 -->
+
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>LSApplicationCategoryType</key>
