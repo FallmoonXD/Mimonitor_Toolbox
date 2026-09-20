@@ -1,0 +1,106 @@
+name: macOS Build
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'macos/**'
+      - '.github/workflows/macos.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'macos/**'
+      - '.github/workflows/macos.yml'
+  # tag 推送不受 paths 过滤限制，打 v* 标签就会跑
+  tags:
+    - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 工具链版本
+        run: |
+          swift --version
+          sw_vers
+
+      - name: 编译（debug，先过一遍语法检查）
+        working-directory: macos
+        run: swift build
+
+      - name: 打包 .app（通用二进制）
+        working-directory: macos
+        run: ./build_app.sh
+
+      - name: 校验产物
+        working-directory: macos
+        run: |
+          set -euo pipefail
+          APP=MimonitorToolbox.app
+          M="$APP/Contents/MacOS/MimonitorToolbox"
+          R="$APP/Contents/Resources"
+
+          test -x "$M"                || { echo "缺可执行文件"; exit 1; }
+          test -x "$R/runtime/adb"    || { echo "缺内嵌 adb"; exit 1; }
+          test -f "$R/runtime/MtkDirectTool.jar"     || { echo "缺 MtkDirectTool.jar"; exit 1; }
+          test -f "$R/runtime/ColorfulLedTool.jar"   || { echo "缺 ColorfulLedTool.jar"; exit 1; }
+          test -f "$R/adb_guardian/adbguardian-signed.apk" || { echo "缺保活 apk"; exit 1; }
+          test -f "$R/AppIcon.icns"   || { echo "缺应用图标"; exit 1; }
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")" = "true" \
+              || { echo "未设置 LSUIElement（会在 Dock 常驻）"; exit 1; }
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP/Contents/Info.plist")" = "AppIcon" \
+              || { echo "Info.plist 未引用图标"; exit 1; }
+          iconutil -c iconset "$R/AppIcon.icns" -o /tmp/iconcheck.iconset \
+              || { echo "icns 无法解析"; exit 1; }
+          ls /tmp/iconcheck.iconset | wc -l | grep -q 10 || { echo "icns 尺寸不全"; exit 1; }
+
+          echo "主程序架构: $(lipo -archs "$M")"
+          echo "内嵌 adb 架构: $(lipo -archs "$R/runtime/adb")"
+          lipo -archs "$M" | grep -q x86_64 || { echo "不是通用二进制"; exit 1; }
+          lipo -archs "$M" | grep -q arm64  || { echo "不是通用二进制"; exit 1; }
+
+          codesign --verify --strict "$APP" || { echo "签名校验失败"; exit 1; }
+
+          echo "本地网络权限声明: $(/usr/libexec/PlistBuddy -c 'Print :NSLocalNetworkUsageDescription' "$APP/Contents/Info.plist")"
+
+          # 内嵌的 adb 必须真的能跑（版本号会打到 stderr，一并捕获）
+          "$R/runtime/adb" version 2>&1 | head -1
+
+          du -sh "$APP"
+
+      - name: 压缩（ditto 保留符号链接与权限）
+        working-directory: macos
+        run: ditto -c -k --sequesterRsrc --keepParent MimonitorToolbox.app MimonitorToolbox-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MimonitorToolbox-macos
+          path: macos/MimonitorToolbox-macos.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 只有这一步需要写权限
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: MimonitorToolbox-macos
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: MimonitorToolbox-macos.zip
