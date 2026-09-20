@@ -4,18 +4,22 @@ on:
   push:
     branches:
       - master
+    # 只改了 Python 就别跑 macOS 构建了。
+    # 注意：官方文档明确「Path filters are not evaluated for pushes of tags」，
+    # 所以这条不会挡住下面的 tag 触发。
     paths:
       - 'macos/**'
       - '.github/workflows/macos.yml'
+    # tags 必须写在 push 里面。之前误写在 on 下面与 push 同级，
+    # 那不是合法的触发器键，导致整个工作流 0 秒就挂（workflow file issue）。
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - master
     paths:
       - 'macos/**'
       - '.github/workflows/macos.yml'
-  # tag 推送不受 paths 过滤限制，打 v* 标签就会跑
-  tags:
-    - 'v*'
 
 permissions:
   contents: read
@@ -63,19 +67,25 @@ jobs:
               || { echo "Info.plist 未引用图标"; exit 1; }
           iconutil -c iconset "$R/AppIcon.icns" -o /tmp/iconcheck.iconset \
               || { echo "icns 无法解析"; exit 1; }
-          ls /tmp/iconcheck.iconset | wc -l | grep -q 10 || { echo "icns 尺寸不全"; exit 1; }
+          ICON_COUNT=$(ls /tmp/iconcheck.iconset | wc -l)
+          [ "$ICON_COUNT" -eq 10 ] || { echo "icns 尺寸不全（$ICON_COUNT 个）"; exit 1; }
 
-          echo "主程序架构: $(lipo -archs "$M")"
+          # 注意这里都避免用管道：脚本开了 pipefail，
+          # `... | head -1` / `... | grep -q` 会因为读端提前退出让写端收到 SIGPIPE，
+          # 把整条流水线判成失败 —— 校验明明通过了却报错。
+          ARCH_MAIN=$(lipo -archs "$M")
+          echo "主程序架构: $ARCH_MAIN"
           echo "内嵌 adb 架构: $(lipo -archs "$R/runtime/adb")"
-          lipo -archs "$M" | grep -q x86_64 || { echo "不是通用二进制"; exit 1; }
-          lipo -archs "$M" | grep -q arm64  || { echo "不是通用二进制"; exit 1; }
+          [[ "$ARCH_MAIN" == *x86_64* && "$ARCH_MAIN" == *arm64* ]] \
+              || { echo "不是通用二进制"; exit 1; }
 
           codesign --verify --strict "$APP" || { echo "签名校验失败"; exit 1; }
 
           echo "本地网络权限声明: $(/usr/libexec/PlistBuddy -c 'Print :NSLocalNetworkUsageDescription' "$APP/Contents/Info.plist")"
 
           # 内嵌的 adb 必须真的能跑（版本号会打到 stderr，一并捕获）
-          "$R/runtime/adb" version 2>&1 | head -1
+          ADB_OUT=$("$R/runtime/adb" version 2>&1)
+          echo "${ADB_OUT%%$'\n'*}"
 
           du -sh "$APP"
 
