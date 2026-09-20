@@ -9,9 +9,12 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="MimonitorToolbox"
+# 和 build_app.sh 保持一致
+APP_NAME="红米G Pro ToolBox"
 SRC_APP="$APP_NAME.app"
 DEST_APP="/Applications/$APP_NAME.app"
+# 改名前的旧包名，装完顺手清掉，免得启动台里并排两个图标
+LEGACY_APP="/Applications/MimonitorToolbox.app"
 
 SKIP_BUILD=0
 [ "${1:-}" = "--no-build" ] && SKIP_BUILD=1
@@ -21,25 +24,37 @@ if [ "$SKIP_BUILD" = "0" ]; then
     ./build_app.sh
 else
     echo "==> 跳过构建（使用现有产物）"
-    [ -d "$SRC_APP" ] || { echo "❌ 没有 $SRC_APP，先跑一次完整构建"; exit 1; }
+    # ${SRC_APP} 的大括号不能省：后面紧跟全角逗号，bash 会把它吃进变量名
+    [ -d "$SRC_APP" ] || { echo "❌ 没有 ${SRC_APP}，先跑一次完整构建"; exit 1; }
 fi
 
 echo "==> 退出正在运行的实例"
-if pgrep -f "$DEST_APP/Contents/MacOS" >/dev/null 2>&1; then
-    pkill -f "$DEST_APP/Contents/MacOS" || true
+# 目标路径和旧路径都要先退出。只杀目标路径的话，旧包对应的进程会活下来，
+# 而下面 rm -rf 会把它的 bundle 删掉 —— 结果是一个「文件已删除但仍在运行」
+# 的孤儿进程：顶栏留一个点不动的僵尸图标，而且它可能还占着 adb server（5038），
+# 让新实例连不上显示器。
+KILLED=0
+for app in "$DEST_APP" "$LEGACY_APP"; do
+    pattern="$app/Contents/MacOS"
+    pgrep -f "$pattern" >/dev/null 2>&1 || continue
+    pkill -f "$pattern" || true
     # 等它真的退出，否则下面的 rm 可能撞上还在写入的进程
     for _ in $(seq 1 20); do
-        pgrep -f "$DEST_APP/Contents/MacOS" >/dev/null 2>&1 || break
+        pgrep -f "$pattern" >/dev/null 2>&1 || break
         sleep 0.25
     done
-    echo "    已退出"
-else
-    echo "    （本来就没在运行）"
-fi
+    echo "    已退出：$(basename "$app")"
+    KILLED=1
+done
+[ "$KILLED" = "1" ] || echo "    （本来就没在运行）"
 
 echo "==> 安装到 /Applications"
 rm -rf "$DEST_APP"
 cp -R "$SRC_APP" "$DEST_APP"
+if [ -d "$LEGACY_APP" ]; then
+    rm -rf "$LEGACY_APP"
+    echo "    已清理旧包名 $(basename "$LEGACY_APP")"
+fi
 # 让 LaunchServices 重新登记，否则 Finder / 启动台 / 权限列表可能还显示旧名字或旧图标
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEST_APP"
 

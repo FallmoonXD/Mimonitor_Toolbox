@@ -19,10 +19,11 @@ Redmi G Pro 27U 2026显示器 ADB 控制工具
 
 ```bash
 cd macos
-./build_app.sh          # 打包成自包含的 .app（Intel + Apple Silicon 通用）
-open MimonitorToolbox.app
+./build_app.sh          # 打包成自包含的 .app + 拖动安装的 .dmg（Intel + Apple Silicon 通用）
+open "红米G Pro ToolBox.app"
 ```
 
+- **拖动安装**：`.dmg` 挂载后把 app 拖进 Applications 即完成，和常见 macOS 软件一样
 - **菜单栏常驻**：不在 Dock，顶栏图标下拉即可快捷调节（画面模式 / 精密控光 / 背光…，可自定义）
 - **全局快捷键**：自带悬浮提示与可调倒计时
 - **无需任何依赖**：adb 会自动下载并内嵌进 .app，最终用户双击即用

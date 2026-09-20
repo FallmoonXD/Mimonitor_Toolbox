@@ -14,7 +14,7 @@ import re
 import subprocess
 import sys
 
-ADB = "/Applications/MimonitorToolbox.app/Contents/Resources/runtime/adb"
+ADB = "/Applications/红米G Pro ToolBox.app/Contents/Resources/runtime/adb"
 SERIAL = os.environ.get("MIMONITOR_SERIAL", "192.168.5.205:5555")
 JAR_MTK = "/data/data/mitv.service/cache/MtkDirectTool.jar"
 CACHE = "/data/data/mitv.service/cache"

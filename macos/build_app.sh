@@ -1,8 +1,8 @@
 #!/bin/bash
-# 打包 MimonitorToolbox 为可直接分发的 .app（无需 Xcode，仅需命令行工具里的 swift）
+# 打包为可直接分发的 .app（无需 Xcode，仅需命令行工具里的 swift）
 #
 # 用法：  cd macos && ./build_app.sh
-# 产物：  .build/MimonitorToolbox.app
+# 产物：  macos/红米G Pro ToolBox.app  +  macos/红米G Pro ToolBox.dmg
 #
 # 所有运行时资源都会被内嵌进 .app，最终用户无需安装任何东西（不需要 brew / adb）：
 #   - adb      : 优先用仓库 assets/runtime/adb；没有就自动从 Google 官方下载 platform-tools 并缓存
@@ -12,7 +12,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-APP_NAME="MimonitorToolbox"
+# 对外的名字 —— Finder 里的 .app 名字、DMG 名字都用它。
+# 可以随便改成中文，包名不影响任何东西（.app 就是个目录，系统不看目录名）。
+APP_NAME="红米G Pro ToolBox"
+
+# 内部的名字 —— 可执行文件名。必须和 Package.swift 的产物名、Info.plist 里
+# 的 CFBundleExecutable 三者保持一致；跟 .app 的目录名无关，所以改显示名时
+# 不用动它。系统记录的「进程名」也取自这里（Activity Monitor / System Events
+# 里看到的仍是 MimonitorToolbox）。
+EXEC_NAME="MimonitorToolbox"
+
 BUILD_DIR=".build"   # swift 的中间产物，隐藏目录
 CACHE_DIR=".cache"   # platform-tools 下载缓存，隐藏目录
 # 最终 .app 直接放在 macos/ 下，方便在 Finder 里直接看到（已在 .gitignore 中排除 *.app）
@@ -72,28 +81,28 @@ fetch_adb() {
 # 想加快本地构建可以 UNIVERSAL=0 ./build_app.sh
 UNIVERSAL="${UNIVERSAL:-1}"
 
-echo "==> 1/5 编译 release 版本（通用二进制: ${UNIVERSAL}）..."
+echo "==> 1/6 编译 release 版本（通用二进制: ${UNIVERSAL}）..."
 if [ "$UNIVERSAL" = "1" ]; then
     swift build -c release --arch arm64
     swift build -c release --arch x86_64
-    BIN_PATH="$BUILD_DIR/release-universal/$APP_NAME"
+    BIN_PATH="$BUILD_DIR/release-universal/$EXEC_NAME"
     mkdir -p "$(dirname "$BIN_PATH")"
     lipo -create -output "$BIN_PATH" \
-        "$BUILD_DIR/arm64-apple-macosx/release/$APP_NAME" \
-        "$BUILD_DIR/x86_64-apple-macosx/release/$APP_NAME"
+        "$BUILD_DIR/arm64-apple-macosx/release/$EXEC_NAME" \
+        "$BUILD_DIR/x86_64-apple-macosx/release/$EXEC_NAME"
 else
     swift build -c release
-    BIN_PATH="$BUILD_DIR/release/$APP_NAME"
+    BIN_PATH="$BUILD_DIR/release/$EXEC_NAME"
 fi
 echo "    架构: $(lipo -archs "$BIN_PATH")"
 
-echo "==> 2/5 组装 .app 目录结构..."
+echo "==> 2/6 组装 .app 目录结构..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 
-cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
+cp "$BIN_PATH" "$MACOS_DIR/$EXEC_NAME"
 
-echo "==> 3/5 内嵌运行时资源（adb / jar / 保活 apk）..."
+echo "==> 3/6 内嵌运行时资源（adb / jar / 保活 apk）..."
 mkdir -p "$RES_DIR/runtime" "$RES_DIR/adb_guardian"
 
 ADB_SRC="$(fetch_adb)"
@@ -133,7 +142,7 @@ else
     echo "    警告：未找到 ${ICON_SRC}，将使用系统默认图标"
 fi
 
-echo "==> 4/5 生成 Info.plist..."
+echo "==> 4/6 生成 Info.plist..."
 cat > "$CONTENTS/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -170,7 +179,7 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "==> 5/5 签名..."
+echo "==> 5/6 签名..."
 # 去掉浏览器下载带来的隔离属性，否则内嵌的 adb 会被 Gatekeeper 拦下
 xattr -cr "$APP_DIR" 2>/dev/null || true
 # adb 自带 Google 的 Developer ID 签名，能用就保留；失效时再 ad-hoc 补签
@@ -200,9 +209,22 @@ else
         || echo "    签名失败"
 fi
 
+# 顺手打个 DMG（拖进 Applications 即安装，macOS 上最常见的分发方式）。
+# 失败不影响 .app 本身，所以只警告不中断。
+echo "==> 6/6 打包 DMG（可拖动安装）..."
+DMG_NAME="$APP_NAME.dmg"
+if ./make_dmg.sh >/dev/null 2>&1; then
+    # 必须写 ${DMG_NAME} —— bash 在 UTF-8 locale 下会把紧跟其后的全角「（」
+    # 当成变量名的一部分，`$DMG_NAME（` 会变成 `DMG_NAME（: unbound variable`。
+    # 中文字符紧跟在变量后面时一律加大括号。
+    echo "    已生成 ${DMG_NAME}（$(du -h "$DMG_NAME" | cut -f1)）"
+else
+    echo "    ⚠️ DMG 生成失败，跳过（.app 本身没问题）"
+fi
+
 echo ""
-echo "完成！.app 就在 macos/ 目录下：$APP_DIR"
-echo "  · 运行：      open $APP_DIR"
-echo "  · 复制安装：  cp -R $APP_DIR /Applications/"
-echo "  · 分发：把 $APP_NAME.app 压缩成 zip 发给别人即可，对方无需安装 adb 或 brew"
+echo "完成！产物都在 macos/ 目录下："
+echo "  · $APP_DIR      直接双击运行"
+echo "  · $DMG_NAME    分发用 —— 对方挂载后把 app 拖进 Applications"
+echo "  · 安装到本机：  ./reinstall.sh --no-build"
 echo "  · 全局快捷键：首次使用需在 系统设置→隐私与安全性→辅助功能 中授权"

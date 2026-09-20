@@ -55,7 +55,9 @@ jobs:
         working-directory: macos
         run: |
           set -euo pipefail
-          APP=MimonitorToolbox.app
+          # .app 的目录名就是产品名（中文，含空格），所以必须加引号；
+          # 包内的可执行文件名仍是 MimonitorToolbox，跟 Package.swift 一致。
+          APP="红米G Pro ToolBox.app"
           M="$APP/Contents/MacOS/MimonitorToolbox"
           R="$APP/Contents/Resources"
 
@@ -93,14 +95,29 @@ jobs:
 
           du -sh "$APP"
 
-      - name: 压缩（ditto 保留符号链接与权限）
+      # build_app.sh 最后一步已经生成 DMG，这里再补一个 zip：
+      # DMG 给普通用户（挂载后拖进 Applications），zip 给习惯解压的人。
+      - name: 补一个 zip（ditto 保留符号链接与权限）
         working-directory: macos
-        run: ditto -c -k --sequesterRsrc --keepParent MimonitorToolbox.app MimonitorToolbox-macos.zip
+        run: ditto -c -k --sequesterRsrc --keepParent "红米G Pro ToolBox.app" "红米G Pro ToolBox.zip"
 
+      - name: 确认分发包都在
+        working-directory: macos
+        run: |
+          set -euo pipefail
+          test -f "红米G Pro ToolBox.dmg" || { echo "缺 DMG"; exit 1; }
+          test -f "红米G Pro ToolBox.zip" || { echo "缺 zip"; exit 1; }
+          ls -lh "红米G Pro ToolBox.dmg" "红米G Pro ToolBox.zip"
+
+      # path 用通配符而不是写死文件名：文件名带空格和中文，
+      # upload-artifact 内部走 glob 匹配，写死容易在空格上翻车。
+      # 少文件的情况由上一步的 test -f 兜底，这里再加 if-no-files-found 双保险。
       - uses: actions/upload-artifact@v4
         with:
-          name: MimonitorToolbox-macos
-          path: macos/MimonitorToolbox-macos.zip
+          name: mimonitor-macos
+          path: |
+            macos/*.dmg
+            macos/*.zip
           if-no-files-found: error
           retention-days: 30
 
@@ -113,8 +130,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: MimonitorToolbox-macos
+          name: mimonitor-macos
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: MimonitorToolbox-macos.zip
+          # DMG 是主推的（拖进 Applications 即安装），zip 作为备选。
+          # 同样用通配符：真实文件名是「红米G Pro ToolBox.dmg」，带中文和空格。
+          files: |
+            *.dmg
+            *.zip

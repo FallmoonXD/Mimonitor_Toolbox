@@ -3,10 +3,17 @@
 红米 G Pro 27U 2026 显示器的原生 macOS 控制工具。这是原 PyQt6/Windows 版的 SwiftUI 移植，
 UI 结构与交互逐页对齐 `mimonitor_toolbox/pages.py`，ADB 协议层对齐 `mimonitor_toolbox/adb.py`。
 
-> **命名**：应用显示名是「红米G Pro ToolBox」，但 bundle id（`com.mimonitor.toolbox`）、
-> 可执行文件名（`MimonitorToolbox`）、产物文件名都保持原样。
-> 这几个是身份标识 —— 一改，已授予的辅助功能权限、本地网络授权、
-> 保存的 IP / 快捷键配置就全部失效了。想要显示名以外的改动请先确认。
+> **命名**：对外的名字统一是「红米G Pro ToolBox」—— .app 的目录名、DMG 名、
+> 卷标、菜单栏、权限弹窗里显示的都是它。但有两个**内部标识保持英文、不要改**：
+>
+> | | 值 | 为什么不能改 |
+> | --- | --- | --- |
+> | bundle id | `com.mimonitor.toolbox` | 辅助功能 / 本地网络 / 保存的 IP 和快捷键配置都挂在它上面 |
+> | 可执行文件名 | `MimonitorToolbox` | 必须与 `Package.swift` 的产物名和 `Info.plist` 的 `CFBundleExecutable` 三者一致 |
+>
+> `.app` 就是个目录，目录名叫什么系统都不看，所以改中文没有任何副作用。
+> 唯一的影响：**已经授权过的机器改名后会重新问一次权限**（路径变了），
+> 重新点一次允许即可 —— bundle id 和签名身份没变，所以能再次授予。
 
 ## 软件截图
 
@@ -44,7 +51,7 @@ swift run MimonitorToolbox   # 运行（开发调试）
 ```bash
 cd macos
 ./build_app.sh
-open MimonitorToolbox.app
+open "红米G Pro ToolBox.app"
 ```
 
 默认产出**通用二进制**（Intel + Apple Silicon）。做法是分架构各编一次再 `lipo` 合并 ——
@@ -61,12 +68,14 @@ open MimonitorToolbox.app
 4. 生成 `Info.plist`；
 5. 清理隔离属性并 ad-hoc 签名（adb 保留 Google 自带的 Developer ID 签名）。
 
-产物就是 **`macos/MimonitorToolbox.app`**（直接放在 macos 目录下，方便 Finder 里看到；
-已在 `.gitignore` 中排除，不会进版本库）。约 20MB，**自包含、零外部依赖**：
+产物是 **`macos/红米G Pro ToolBox.app`** 和 **`macos/红米G Pro ToolBox.dmg`**（直接放在 macos
+目录下，方便 Finder 里看到；已在 `.gitignore` 中排除，不会进版本库）。
+约 20MB，**自包含、零外部依赖**：
 
 ```bash
-cp -R MimonitorToolbox.app /Applications/    # 本机安装
-# 分发给别人：压缩成 zip 发过去，对方解压双击即可，不需要 adb / brew / Python
+./reinstall.sh --no-build              # 本机安装到 /Applications 并重启
+# 分发给别人：把 .dmg 发过去，对方双击挂载后把 app 拖进 Applications 即完成安装，
+# 不需要 adb / brew / Python
 ```
 
 > 想固定 adb 版本而不走自动下载：把 macOS 版 `adb` 放到仓库根的 `assets/runtime/adb`，
