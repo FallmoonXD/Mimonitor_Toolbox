@@ -536,6 +536,131 @@ class DisplayFeaturesMixin:
             prefix = "已开启" if enabled else "已关闭"
             label.setText(f"FreeSync 模式记忆：{prefix}，开启时将记录当前模式：{mode_text}")
 
+    # ── 准星模式联动 ──────────────────────────────────────────────
+    # 准星 front_sight_index 是设备级 settings，与 picture_mode 解耦，
+    # 不主动清理的话切到标准/电影等模式后准星依然显示。
+
+    def _crosshair_game_mode_only_enabled(self):
+        return bool(load_settings().get("crosshair_game_mode_only", True))
+
+    def _get_crosshair_memory(self):
+        try:
+            return int(load_settings().get("crosshair_memory"))
+        except (TypeError, ValueError):
+            return None
+
+    def _save_crosshair_memory(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return
+        update_settings({"crosshair_memory": value})
+        self._update_crosshair_mode_status_label()
+
+    def _clear_crosshair_memory(self):
+        update_settings({"crosshair_memory": None})
+        self._update_crosshair_mode_status_label()
+
+    def _update_crosshair_mode_status_label(self):
+        label = getattr(self, "crosshair_mode_status_label", None)
+        if not label:
+            return
+        if not self._crosshair_game_mode_only_enabled():
+            label.setText("准星模式联动：已关闭，准星在所有模式下都生效")
+            return
+        memory = self._get_crosshair_memory()
+        memory_text = f"已记忆准星 {memory}" if memory else "暂无记忆"
+        label.setText(f"准星模式联动：已开启（{memory_text}，离开游戏模式时自动隐藏）")
+
+    def _toggle_crosshair_game_mode_only(self, state):
+        try:
+            state_val = int(state)
+        except Exception:
+            state_val = getattr(state, "value", 0)
+        enabled = state_val == Qt.CheckState.Checked.value
+        update_settings({"crosshair_game_mode_only": enabled})
+        self.log(f"准星仅在游戏模式下生效: {'开启' if enabled else '关闭'}")
+        self._update_crosshair_mode_status_label()
+        if enabled:
+            # 开启时立刻纠正一次当前状态（可能在非游戏模式下正显示着准星）
+            self._reconcile_crosshair_mode_state()
+
+    def _crosshair_value_from_vals(self):
+        raw = getattr(self, "current_vals", {}).get("front_sight_index")
+        if raw in (None, "", "null", "N/A"):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _reconcile_crosshair_mode_state(self):
+        """按当前画面模式纠正准星：离开游戏模式记住并隐藏，进入游戏模式还原。
+
+        由页面数据刷新驱动（含模式切换后的自动刷新），没有周期轮询——
+        用显示器遥控器改模式时，会在下次刷新数据时纠正。
+
+        隐藏是「只要在非游戏模式看到准星就清掉」；还原只在「模式跃迁进入
+        游戏模式」时做一次，避免用户用显示器 OSD 主动关掉准星后又被打开。
+        """
+        if not self._crosshair_game_mode_only_enabled():
+            return
+        if not getattr(self, "adb_connected", False):
+            return
+        if getattr(self, "_crosshair_reconcile_busy", False):
+            return
+        current_vals = getattr(self, "current_vals", {})
+        mode = current_vals.get("picture_mode")
+        if mode in (None, "", "null", "N/A"):
+            return
+        crosshair = self._crosshair_value_from_vals()
+        if crosshair is None:
+            return
+
+        previous_mode = getattr(self, "_crosshair_last_mode", None)
+        self._crosshair_last_mode = mode
+        in_game_mode = is_game_picture_mode(mode)
+
+        if in_game_mode:
+            entering_game_mode = (
+                previous_mode is not None
+                and not is_game_picture_mode(previous_mode)
+            )
+            memory = self._get_crosshair_memory()
+            if entering_game_mode and crosshair == 0 and memory:
+                self._apply_crosshair_mode_value(
+                    memory, f"进入游戏模式，已恢复记忆的准星 {memory}"
+                )
+            return
+
+        if crosshair != 0:
+            self._save_crosshair_memory(crosshair)
+            self._apply_crosshair_mode_value(
+                0, f"离开游戏模式，已隐藏准星（记忆 {crosshair}）"
+            )
+
+    def _apply_crosshair_mode_value(self, value, message):
+        self._crosshair_reconcile_busy = True
+        self._mark_adb_busy(2.5)
+
+        def operation():
+            with self.adb.transaction():
+                self.adb.put("front_sight_index", str(value), check=True)
+                self.adb.refresh_pq(check=True)
+
+        def success():
+            self.log(message)
+            self.current_vals["front_sight_index"] = value
+            self._update_crosshair_mode_status_label()
+            # 同步按钮高亮；重入的 reconcile 由 busy 标记挡住
+            self.values_signal.emit({"front_sight_index": value})
+            self._crosshair_reconcile_busy = False
+
+        def failure():
+            self._crosshair_reconcile_busy = False
+
+        self._run_adb_action("准星模式联动", operation, success, failure)
+
     def _mark_adb_busy(self, seconds=2.0):
         self._adb_busy_until = max(getattr(self, "_adb_busy_until", 0.0), time.monotonic() + seconds)
 
@@ -950,6 +1075,7 @@ class DisplayFeaturesMixin:
             self._highlight_mode(val)
             self.log(f"模式: {name}")
             self._page_loaded.discard("picturePage")
+            self._reconcile_crosshair_mode_state()
             QTimer.singleShot(1200, lambda seq=seq, val=val: self._refresh_picture_page_after_mode_switch(seq, val))
 
         def failure():
@@ -1274,6 +1400,12 @@ class DisplayFeaturesMixin:
         self._run_adb_action(title, operation, success, failure)
 
     def _fs(self, v):
+        # 用户在游戏模式下的主动选择同步进记忆：关掉即清记忆（避免下次回到
+        # 游戏模式又被自动还原回来），选了样式则更新记忆值。
+        if v == 0:
+            self._clear_crosshair_memory()
+        else:
+            self._save_crosshair_memory(v)
         self._set_game_feature(
             "front_sight_index",
             v,

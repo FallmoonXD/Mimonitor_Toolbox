@@ -38,6 +38,8 @@ def _load_settings_unlocked():
         "local_dimming_toggle_last_value": 3,
         "freesync_mode_memory_enabled": False,
         "freesync_previous_mode": None,
+        "crosshair_game_mode_only": True,
+        "crosshair_memory": None,
     }
     path = get_settings_path()
     data = {}

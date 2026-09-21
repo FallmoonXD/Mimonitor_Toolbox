@@ -715,6 +715,20 @@ class PagesMixin:
         self.freesync_memory_status_label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
         c3_lay.addWidget(self.freesync_memory_status_label)
 
+        crosshair_memory_layout = QHBoxLayout()
+        crosshair_memory_layout.setSpacing(15)
+        self.chk_crosshair_game_mode_only = CheckBox("准星仅在游戏模式下生效", card3)
+        self.chk_crosshair_game_mode_only.setChecked(self._crosshair_game_mode_only_enabled())
+        self.chk_crosshair_game_mode_only.stateChanged.connect(self._toggle_crosshair_game_mode_only)
+        crosshair_memory_layout.addWidget(self.chk_crosshair_game_mode_only)
+        crosshair_memory_layout.addStretch()
+        c3_lay.addLayout(crosshair_memory_layout)
+
+        self.crosshair_mode_status_label = CaptionLabel("", card3)
+        self.crosshair_mode_status_label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
+        c3_lay.addWidget(self.crosshair_mode_status_label)
+        self._update_crosshair_mode_status_label()
+
         grid.addWidget(card3, 2, 0, 1, 2)
 
         # 4K UI Card

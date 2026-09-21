@@ -83,6 +83,14 @@ final class AppState: ObservableObject {
     @Published var freesyncMemoryEnabled = UserDefaults.standard.bool(forKey: "freesync_mode_memory_enabled")
     @Published var hdrMemoryStatusText = ""
     @Published var freesyncMemoryStatusText = ""
+    /// 准星是否只在游戏模式下生效。默认值 true 在 App.init() 里用
+    /// register(defaults:) 注册，所以这里可以直接用 bool(forKey:)。
+    @Published var crosshairGameModeOnly = UserDefaults.standard.bool(forKey: "crosshair_game_mode_only")
+    @Published var crosshairModeStatusText = ""
+    /// 准星联动写入进行中，挡住重入的 reconcile
+    private var crosshairReconcileBusy = false
+    /// 上一次对账时的画面模式，用于区分「进入游戏模式」与「一直在游戏模式」
+    private var crosshairLastMode: String?
     /// 本 app 是否已获辅助功能权限（和终端是两回事，各算各的）
     @Published var accessibilityTrusted = HotkeyManager.isTrusted
 
@@ -132,6 +140,7 @@ final class AppState: ObservableObject {
         hotkeyManager.start()
         updateHdrMemoryStatus()
         updateFreesyncMemoryStatus()
+        updateCrosshairModeStatus()
         Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
             self?.pollHdrState()
         }
@@ -585,6 +594,11 @@ final class AppState: ObservableObject {
             DispatchQueue.main.async {
                 if !corrections.isEmpty { self.mergeValues(corrections) }
 
+                // 拿到新鲜的 picture_mode + front_sight_index 后按模式纠正准星
+                if page == "picture" || page == "game" {
+                    self.reconcileCrosshairModeState()
+                }
+
                 if page == "source",
                    let s = settingsVals["mitv.tvplayer.hdmi.last.source"],
                    let n = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
@@ -622,6 +636,7 @@ final class AppState: ObservableObject {
         let name = RegisterMap.modeNames[value] ?? "\(value)"
         currentValues["picture_mode"] = String(value)
         log("模式: \(name)")
+        reconcileCrosshairModeState()
         runBackground {
             self.adb.settingsPut("picture_mode", String(value))
             DispatchQueue.main.async {
@@ -777,6 +792,13 @@ final class AppState: ObservableObject {
 
     func setCrosshair(_ value: Int) {
         guard isConnected else { return log("未连接") }
+        // 用户在游戏模式下的主动选择同步进记忆：关掉即清记忆（避免下次回到
+        // 游戏模式又被自动还原回来），选了样式则更新记忆值。
+        if value == 0 {
+            clearCrosshairMemory()
+        } else {
+            saveCrosshairMemory(value)
+        }
         currentValues["front_sight_index"] = String(value)
         log("准星: \(value == 0 ? "关" : "\(value)")")
         runBackground {
@@ -1433,6 +1455,93 @@ final class AppState: ObservableObject {
         let savedText = saved == 0 ? "--" : (RegisterMap.sceneNames[saved] ?? "\(saved)")
         let text = "模式记忆：\(freesyncMemoryEnabled ? "已开启" : "已关闭")，记录模式：\(savedText)"
         if freesyncMemoryStatusText != text { freesyncMemoryStatusText = text }
+    }
+
+    // MARK: - 准星模式联动
+    //
+    // front_sight_index 是设备级 settings，与 picture_mode 解耦：不主动清理的话，
+    // 切到标准/电影等模式后准星依然显示。这里在离开游戏模式时记住并隐藏，
+    // 回到游戏模式时还原。
+
+    private var crosshairMemory: Int? {
+        guard UserDefaults.standard.object(forKey: "crosshair_memory") != nil else { return nil }
+        return UserDefaults.standard.integer(forKey: "crosshair_memory")
+    }
+
+    private func saveCrosshairMemory(_ value: Int) {
+        UserDefaults.standard.set(value, forKey: "crosshair_memory")
+        updateCrosshairModeStatus()
+    }
+
+    private func clearCrosshairMemory() {
+        UserDefaults.standard.removeObject(forKey: "crosshair_memory")
+        updateCrosshairModeStatus()
+    }
+
+    func toggleCrosshairGameModeOnly(_ enabled: Bool) {
+        crosshairGameModeOnly = enabled
+        UserDefaults.standard.set(enabled, forKey: "crosshair_game_mode_only")
+        log("准星仅在游戏模式下生效: \(enabled ? "开启" : "关闭")")
+        updateCrosshairModeStatus()
+        if enabled { reconcileCrosshairModeState() }
+    }
+
+    private func updateCrosshairModeStatus() {
+        let text: String
+        if !crosshairGameModeOnly {
+            text = "已关闭，准星在所有模式下都生效"
+        } else if let memory = crosshairMemory {
+            text = "已开启，离开游戏模式时自动隐藏（已记忆准星 \(memory)）"
+        } else {
+            text = "已开启，离开游戏模式时自动隐藏（暂无记忆）"
+        }
+        if crosshairModeStatusText != text { crosshairModeStatusText = text }
+    }
+
+    /// 按当前画面模式纠正准星。由页面数据刷新驱动（含模式切换后的自动刷新），
+    /// 没有周期轮询——用显示器遥控器改模式时，会在下次刷新数据时纠正。
+    ///
+    /// 隐藏是「只要在非游戏模式看到准星就清掉」；还原只在「模式跃迁进入游戏
+    /// 模式」时做一次，避免用户用显示器 OSD 主动关掉准星后又被打开。
+    func reconcileCrosshairModeState() {
+        guard crosshairGameModeOnly, isConnected else { return }
+        guard !crosshairReconcileBusy else { return }
+        guard let mode = currentValues["picture_mode"] else { return }
+        guard let raw = currentValues["front_sight_index"],
+              let crosshair = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return
+        }
+
+        let previousMode = crosshairLastMode
+        crosshairLastMode = mode
+
+        if RegisterMap.isGamePictureMode(mode) {
+            let enteringGameMode = previousMode != nil && !RegisterMap.isGamePictureMode(previousMode)
+            if enteringGameMode, crosshair == 0, let memory = crosshairMemory {
+                applyCrosshairModeValue(memory, message: "进入游戏模式，已恢复记忆的准星 \(memory)")
+            }
+            return
+        }
+
+        if crosshair != 0 {
+            saveCrosshairMemory(crosshair)
+            applyCrosshairModeValue(0, message: "离开游戏模式，已隐藏准星（记忆 \(crosshair)）")
+        }
+    }
+
+    private func applyCrosshairModeValue(_ value: Int, message: String) {
+        crosshairReconcileBusy = true
+        runBackground {
+            self.adb.settingsPut("front_sight_index", String(value))
+            self.adb.refreshPq()
+            DispatchQueue.main.async {
+                self.log(message)
+                self.mergeValues(["front_sight_index": String(value)])
+                self.updateCrosshairModeStatus()
+                // 重入的 reconcile 由 busy 标记挡住，结束后再放开
+                self.crosshairReconcileBusy = false
+            }
+        }
     }
 
     // MARK: - 开机自启动

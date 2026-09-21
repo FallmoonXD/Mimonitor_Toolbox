@@ -1302,6 +1302,13 @@ class DeviceFeaturesMixin:
         if callable(update_game_hint):
             update_game_hint()
 
+        # 拿到新鲜的 picture_mode + front_sight_index 后按模式纠正准星
+        reconcile_crosshair = getattr(self, "_reconcile_crosshair_mode_state", None)
+        if callable(reconcile_crosshair) and (
+            "picture_mode" in vals or "front_sight_index" in vals
+        ):
+            reconcile_crosshair()
+
     def _apply_polled_jni_values(self, vals):
         self.current_vals.update(vals)
         if "g_disp__disp_back_light" in vals and "backlight" in self.sliders:

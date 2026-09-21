@@ -118,6 +118,16 @@ struct MimonitorToolboxApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var state = AppState()
 
+    init() {
+        // 默认值为 true 的设置必须在这里注册，不能放 AppState.init()：
+        // AppState 的属性初始化器先于它自己的 init 执行，那时注册已经太晚。
+        // 注册后 bool(forKey:) 在任何位置都安全（未写入时返回这里的值）。
+        // 默认值为 false 的设置不需要注册——UserDefaults 对 Bool 的内置回退就是 false。
+        UserDefaults.standard.register(defaults: [
+            "crosshair_game_mode_only": true,
+        ])
+    }
+
     var body: some Scene {
         // 用 Window（单例）而不是 WindowGroup：这是单窗口工具，
         // 而且菜单栏的「显示主窗口」需要能按 id 精确唤回同一个窗口。

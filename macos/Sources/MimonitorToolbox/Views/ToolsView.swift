@@ -137,6 +137,15 @@ struct ToolsView: View {
                     Text(state.freesyncMemoryStatusText).font(.callout).foregroundColor(.secondary)
                 }
 
+                // 准星模式联动
+                SectionCard(title: "准星模式联动") {
+                    Toggle("准星仅在游戏模式下生效", isOn: Binding(
+                        get: { state.crosshairGameModeOnly },
+                        set: { state.toggleCrosshairGameModeOnly($0) }
+                    ))
+                    Text(state.crosshairModeStatusText).font(.callout).foregroundColor(.secondary)
+                }
+
                 // APK 安装
                 SectionCard(title: "APK 安装") {
                     Text("选择本地 .apk 文件，通过 adb install -r -d 安装到显示器。")

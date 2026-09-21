@@ -125,6 +125,60 @@ class PageContractTests(unittest.TestCase):
         window.deleteLater()
         _qt_application.processEvents()
 
+    def test_crosshair_toggle_lives_in_tools_page_and_defaults_on(self):
+        """准星联动开关放在软件设置页（不在游戏页），且默认开启。"""
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.main_window import App
+
+        with mock.patch.object(display_features, "load_settings", return_value={
+            "crosshair_game_mode_only": True,
+            "crosshair_memory": None,
+        }), mock.patch.object(App, "register_global_hotkeys"), \
+                mock.patch.object(App, "setup_tray"):
+            window = App()
+
+        tools_toggles = {
+            button.text(): button
+            for button in window.tools_page.findChildren(QAbstractButton)
+        }
+        game_toggles = {
+            button.text(): button
+            for button in window.game_page.findChildren(QAbstractButton)
+        }
+        self.assertIn("准星仅在游戏模式下生效", tools_toggles)
+        self.assertTrue(tools_toggles["准星仅在游戏模式下生效"].isChecked())
+        self.assertNotIn("准星仅在游戏模式下生效", game_toggles)
+        window._cleanup_done = True
+        window.deleteLater()
+        _qt_application.processEvents()
+
+    def test_polled_non_game_mode_triggers_crosshair_reconcile(self):
+        """用遥控器改模式（非应用发起）后，页面刷新数据时也要纠正准星。"""
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.main_window import App
+
+        settings = {"crosshair_game_mode_only": True, "crosshair_memory": None}
+
+        with mock.patch.object(App, "register_global_hotkeys"), \
+                mock.patch.object(App, "setup_tray"):
+            window = App()
+
+        window.adb_connected = True
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings", side_effect=settings.update), \
+                mock.patch.object(window, "_apply_crosshair_mode_value") as apply_value:
+            window._apply_polled_values({
+                "picture_mode": 14,
+                "front_sight_index": 3,
+            })
+
+        apply_value.assert_called_once()
+        self.assertEqual(apply_value.call_args[0][0], 0)
+        self.assertEqual(settings["crosshair_memory"], 3)
+        window._cleanup_done = True
+        window.deleteLater()
+        _qt_application.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()
