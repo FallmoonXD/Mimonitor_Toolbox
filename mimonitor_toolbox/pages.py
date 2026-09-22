@@ -8,7 +8,7 @@ import os
 import sys
 import time
 
-from PyQt6.QtCore import QSize, Qt, QTimer
+from PyQt6.QtCore import QSize, QTime, Qt, QTimer
 from PyQt6.QtGui import QColor, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -58,7 +58,21 @@ from .core import (
     load_settings,
     update_settings,
 )
-from .widgets import TRAY_ROW_HEIGHT, PageScrollSlider, TrayItemList
+from .presets import BASELINE_PRESET_ID, find_preset, new_id, unique_name
+from .widgets import (
+    TRAY_ROW_HEIGHT,
+    AddPresetCard,
+    AddTaskCard,
+    AutoTaskCard,
+    FlowContainer,
+    PageScrollSlider,
+    PresetCard,
+    PresetNameDialog,
+    TrayItemList,
+)
+
+# 有预设生效时两个「记忆」暂停的原因说明（既是开关的括号提示，也是 tooltip）
+MEMORY_TAKEOVER_HINT = "使用预设时由预设接管"
 
 
 # 行高常量（TRAY_ROW_HEIGHT）由 widgets.TrayRowDelegate 拥有，这里只定义可见行数上限
@@ -77,6 +91,8 @@ class PagesMixin:
         self.source_page = self._make_source_page()
         self.light_page = self._make_light_page()
         self.tray_page = self._make_tray_page()
+        self.preset_page = self._make_preset_page()
+        self.auto_task_page = self._make_auto_task_page()
         self.tools_page = self._make_tools_page()
         self.remote_page = self._make_remote_page()
 
@@ -86,6 +102,8 @@ class PagesMixin:
         self.source_page.setObjectName("sourcePage")
         self.light_page.setObjectName("lightPage")
         self.tray_page.setObjectName("trayPage")
+        self.preset_page.setObjectName("presetPage")
+        self.auto_task_page.setObjectName("autoTaskPage")
         self.tools_page.setObjectName("toolsPage")
         self.remote_page.setObjectName("remotePage")
 
@@ -96,6 +114,8 @@ class PagesMixin:
         self.addSubInterface(self.source_page, FIF.SYNC, "信号源切换")
         self.addSubInterface(self.light_page, FIF.BRIGHTNESS, "屏幕灯")
         self.addSubInterface(self.tray_page, FIF.MENU, "托盘菜单")
+        self.addSubInterface(self.preset_page, FIF.SAVE, "预设模式")
+        self.addSubInterface(self.auto_task_page, FIF.CALENDAR, "自动任务")
         self.addSubInterface(self.tools_page, FIF.DEVELOPER_TOOLS, "工具与设置")
         self.addSubInterface(self.remote_page, FIF.TILES, "遥控器")
 
@@ -254,6 +274,7 @@ class PagesMixin:
         refresh_pic_btn.clicked.connect(lambda: self._force_refresh_page("picturePage"))
         title_row.addWidget(refresh_pic_btn)
         layout.addLayout(title_row)
+
 
         # Mode Selector Card
         lf = SimpleCardWidget(container)
@@ -650,6 +671,265 @@ class PagesMixin:
         if ordered and ordered != self._tray_item_ids():
             update_settings({"tray_items": ordered})
 
+    # ===== 预设 / 自动任务的数据同步 =====
+
+    def _preset_list(self):
+        presets = load_settings().get("presets")
+        return presets if isinstance(presets, list) else []
+
+    def _auto_task_list(self):
+        tasks = load_settings().get("auto_tasks")
+        return tasks if isinstance(tasks, list) else []
+
+    def _preset_sync(self):
+        """重建预设卡片网格，并刷新自动任务的预设下拉。
+
+        「无预设」永远第一张，「+」永远最后一张；中间是各预设。
+        卡片是整体重建的 —— 它们的数量和名字随时会变，而重建一颗卡片比
+        逐个增量更新简单得多（这里没有会吞掉动画状态的子控件）。
+        """
+        active_id = self.active_preset_id()          # None = 无预设
+        host = getattr(self, "preset_flow_host", None)
+        if host is not None:
+            flow = host.flow()
+            flow.removeAllWidgets()
+            # removeAllWidgets 只是把控件从布局里**摘掉**，不会解除父子关系：
+            # 被摘掉的卡片仍是可见的子控件，停在上一轮的位置上，于是每次重建
+            # 都会在旧卡片上面再叠一层（表现为重影、错位的按钮）。必须显式销毁。
+            self._destroy_preset_cards(host)
+            flow.addWidget(self._make_baseline_card(host, active_id is None))
+            for preset in self._preset_list():
+                flow.addWidget(self._make_preset_card(
+                    preset, host, preset.get("id") == active_id))
+            add_card = AddPresetCard(host)
+            add_card.clicked.connect(self._preset_add)
+            flow.addWidget(add_card)
+            host.refresh_height()
+        self._auto_task_sync()
+        self._sync_memory_toggle_availability()
+        # 顶部指示条跟着走 —— _preset_sync 有几条被直接调用的路径（应用后延时刷新）
+        if hasattr(self, "_update_preset_banner"):
+            self._update_preset_banner()
+
+    @staticmethod
+    def _destroy_preset_cards(host):
+        for child in host.findChildren(QWidget):
+            if isinstance(child, (PresetCard, AddPresetCard)):
+                child.setParent(None)
+                child.deleteLater()
+
+    def _make_baseline_card(self, parent, active):
+        """「无预设」= 不用任何预设的普通状态。
+
+        它自身不存值 —— 点它的「应用」是退回到套预设之前的那份值（快照）。
+        没有快照（还没套过预设）时按钮置灰。
+        """
+        snapshot = load_settings().get("preset_snapshot")
+        has_snapshot = bool(isinstance(snapshot, dict) and snapshot.get("values"))
+        # 文案保持一行 —— 卡片只有 240×140，带换行会撑出卡片外
+        caption = "不使用任何预设"
+        card = PresetCard(BASELINE_PRESET_ID, "无预设", caption, parent,
+                          apply_enabled=has_snapshot, editable=False,
+                          active=active, managed=False)
+        if has_snapshot:
+            source = snapshot.get("source") or "预设"
+            card.setToolTip(f"点「应用」退回套用「{source}」之前的状态\n"
+                            f"{snapshot.get('at') or ''}")
+        else:
+            card.setToolTip("还没有可退回的状态")
+        card.apply_requested.connect(lambda _pid: self._preset_restore_baseline())
+        return card
+
+    def _make_preset_card(self, preset, parent, active=False):
+        preset_id = preset.get("id")
+        values = preset.get("values") or {}
+        card = PresetCard(preset_id, preset.get("name") or preset_id,
+                          f"{len(values)} 项设置", parent, active=active)
+        card.apply_requested.connect(self._preset_apply)
+        card.edit_requested.connect(self._preset_edit)
+        card.rename_requested.connect(self._preset_rename)
+        card.delete_requested.connect(self._preset_delete)
+        return card
+
+    @staticmethod
+    def _task_time(task, key, fallback):
+        """任务里的 "HH:MM" 文本 -> QTime，坏值退回 fallback。"""
+        text = str(task.get(key) or fallback)
+        hour, _, minute = text.partition(":")
+        try:
+            return QTime(int(hour), int(minute))
+        except ValueError:
+            hour, _, minute = fallback.partition(":")
+            return QTime(int(hour), int(minute))
+
+    def _auto_task_preset_options(self):
+        """下拉选项：第一项固定是「无预设」—— 那条任务表示这段时间不使用任何预设。"""
+        options = [("无预设", BASELINE_PRESET_ID)]
+        for preset in self._preset_list():
+            options.append((preset.get("name") or preset.get("id"), preset.get("id")))
+        return options
+
+    @staticmethod
+    def _clear_task_cards(layout):
+        """销毁旧卡片 —— 只从布局里摘掉的话它们仍是可见子控件，会叠在新卡片上。"""
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def _auto_task_sync(self):
+        """重建任务卡片。卡片本身就是列表，没有独立的列表控件。"""
+        host = getattr(self, "auto_task_cards_host", None)
+        if host is None:
+            return
+        layout = self.auto_task_cards_layout
+        self._clear_task_cards(layout)
+        options = self._auto_task_preset_options()
+        editing_id = getattr(self, "_auto_task_editing_id", None)
+        for task in self._auto_task_list():
+            card = AutoTaskCard(task.get("id"),
+                                self._task_time(task, "start", "08:00"),
+                                self._task_time(task, "end", "10:00"),
+                                task.get("preset_id"), options, host)
+            card.saved.connect(self._auto_task_save)
+            card.deleted.connect(self._auto_task_delete)
+            if task.get("id") == editing_id:
+                card.set_editing(True)      # 刚新建的那条直接进编辑态
+            layout.addWidget(card)
+        add_card = AddTaskCard(host)
+        add_card.clicked.connect(self._auto_task_add)
+        layout.addWidget(add_card)
+
+
+    def _sync_memory_toggle_availability(self):
+        """有预设生效时两个「记忆」暂停：开关置灰，并用 tooltip 说明原因。
+
+        不只是"不能点"——要让人知道为什么。预设和记忆本来就在管同一件事。
+        """
+        suspended = bool(self.active_preset_id())
+        for checkbox in (getattr(self, "chk_hdr_local_dimming_memory", None),
+                         getattr(self, "chk_freesync_mode_memory", None)):
+            if checkbox is None:
+                continue
+            checkbox.setEnabled(not suspended)
+            checkbox.setToolTip(MEMORY_TAKEOVER_HINT if suspended else "")
+
+    def _preset_apply(self, preset_id):
+        self.apply_preset_by_id(preset_id)
+        # 应用后状态落盘，卡片上的「已应用」和画面页提示都要跟着变
+        QTimer.singleShot(3000, self._preset_sync)
+
+    def _preset_restore_baseline(self):
+        if not self.has_preset_snapshot():
+            self.message_signal.emit("warn", "没有可恢复的状态", "还没有套用过预设")
+            return
+        self.restore_preset_snapshot()
+        QTimer.singleShot(3000, self._preset_sync)
+
+    def _ask_preset_name(self, title, value=""):
+        """Fluent 风格的命名对话框；取消或空名返回 None。"""
+        dialog = PresetNameDialog(title, value, self)
+        names = dialog.exec() and dialog.preset_name()
+        dialog.deleteLater()
+        return names or None
+
+    def _preset_add(self):
+        """新建：先要名字，再以当前设备设置把它建出来并切为当前预设。
+
+        没有"保存"按钮，所以创建必须在这一步完成；之后在画面页的调整会通过
+        自动保存继续写进它。
+        """
+        name = self._ask_preset_name("新建预设")
+        if not name:
+            return
+        self.create_preset_from_current(name)
+
+    def _preset_edit(self, preset_id):
+        self.begin_preset_edit(preset_id=preset_id)
+
+    def _preset_rename(self, preset_id):
+        presets = self._preset_list()
+        preset = find_preset(presets, preset_id)
+        if preset is None:
+            return
+        new_name = self._ask_preset_name("重命名预设", preset.get("name") or "")
+        if not new_name:
+            return
+        others = [p for p in presets if p.get("id") != preset_id]
+        preset["name"] = unique_name(others, new_name)
+        update_settings({"presets": presets})
+        self._preset_sync()
+
+    def _preset_delete(self, preset_id):
+        preset = find_preset(self._preset_list(), preset_id)
+        if preset is None:
+            return
+        name = preset.get("name") or preset_id
+        users = [t for t in self._auto_task_list() if t.get("preset_id") == preset_id]
+        extra = f"\n\n有 {len(users)} 个自动任务在引用它，删除后那些任务不会再生效。" if users else ""
+        box = MessageBox("删除预设", f"确定删除预设「{name}」吗？{extra}", self)
+        accepted = box.exec()
+        box.deleteLater()
+        if not accepted:
+            return
+        update_settings({"presets": [p for p in self._preset_list() if p.get("id") != preset_id]})
+        self.log(f"已删除预设「{name}」")
+        self._preset_sync()
+
+    # ===== 自动任务操作 =====
+
+    def _auto_task_add(self):
+        """新增一条，并让它直接进编辑态 —— 时间和预设都还没定，先给个默认值。"""
+        tasks = self._auto_task_list()
+        presets = self._preset_list()
+        default_preset = presets[0].get("id") if presets else BASELINE_PRESET_ID
+        created_id = new_id(tasks, "task")
+        tasks.append({"id": created_id, "start": "08:00", "end": "10:00",
+                      "preset_id": default_preset, "snapshot": None})
+        update_settings({"auto_tasks": tasks})
+        self._auto_task_editing_id = created_id
+        self.log("已新增自动任务，设定好时间后点「保存」")
+        self._auto_task_sync()
+
+    def _auto_task_save(self, task_id, values):
+        start = values.get("start")
+        end = values.get("end")
+        if start == end:
+            self.message_signal.emit("warn", "时间段无效", "开始时间和结束时间不能相同")
+            return
+        tasks = self._auto_task_list()
+        for task in tasks:
+            if task.get("id") == task_id:
+                task.update({"start": start, "end": end,
+                             "preset_id": values.get("preset_id")})
+        update_settings({"auto_tasks": tasks})
+        self._auto_task_editing_id = None
+        self.log(f"已保存自动任务 {start}–{end}")
+        self._auto_task_sync()
+
+    def _auto_task_delete(self, task_id):
+        task = next((t for t in self._auto_task_list() if t.get("id") == task_id), None)
+        if task is None:
+            return
+        box = MessageBox(
+            "删除自动任务",
+            f"确定删除 {task.get('start')}–{task.get('end')} 这个任务吗？",
+            self,
+        )
+        accepted = box.exec()
+        box.deleteLater()
+        if not accepted:
+            return
+        update_settings({"auto_tasks": [t for t in self._auto_task_list()
+                                        if t.get("id") != task_id]})
+        if getattr(self, "_auto_task_editing_id", None) == task_id:
+            self._auto_task_editing_id = None
+        self.log("已删除自动任务")
+        self._auto_task_sync()
+
+
     def _make_tray_page(self):
         scroll = ScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -722,6 +1002,76 @@ class PagesMixin:
         self._tray_sync_both()
         scroll.setWidget(container)
         return scroll
+
+    # ===== 预设模式页 =====
+
+    def _make_preset_page(self):
+        scroll = ScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        container = QWidget()
+        container.setObjectName("Container")
+        container.setStyleSheet("#Container { background: transparent; }")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 20, 30, 20)
+        layout.setSpacing(14)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        layout.addWidget(SubtitleLabel("预设模式", container))
+        hint = CaptionLabel(
+            "「无预设」表示不使用任何预设；正在使用的预设会标上「已应用」，"
+            "此时在画面设置页的改动会自动保存进它。"
+            "点「编辑」进入预览，顶部悬浮条上完成或取消。",
+            container,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # 卡片网格：FlowLayout 按窗口宽度自动换行，高度由 FlowContainer 透出
+        self.preset_flow_host = FlowContainer(container)
+        layout.addWidget(self.preset_flow_host)
+        layout.addStretch(1)
+
+        scroll.setWidget(container)
+        return scroll
+
+    # ===== 自动任务页 =====
+
+    def _make_auto_task_page(self):
+        scroll = ScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        container = QWidget()
+        container.setObjectName("Container")
+        container.setStyleSheet("#Container { background: transparent; }")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 20, 30, 20)
+        layout.setSpacing(12)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        layout.addWidget(SubtitleLabel("自动任务", container))
+        hint = CaptionLabel(
+            "在指定时间段内自动套用某个预设，时段结束时还原成进入时段前的设置。"
+            "每天重复；多个任务时段重叠时，靠下的那个生效。"
+            "「套用预设」选「无预设」表示这段时间内不使用任何预设。",
+            container,
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # 卡片即列表：一行一张，最后一张是「+」
+        self.auto_task_cards_host = QWidget(container)
+        self.auto_task_cards_layout = QVBoxLayout(self.auto_task_cards_host)
+        self.auto_task_cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.auto_task_cards_layout.setSpacing(12)
+        layout.addWidget(self.auto_task_cards_host)
+        layout.addStretch(1)
+
+        scroll.setWidget(container)
+        return scroll
+
 
     def _make_tools_page(self):
         scroll = ScrollArea(self)
@@ -964,7 +1314,8 @@ class PagesMixin:
 
         hdr_memory_layout = QHBoxLayout()
         hdr_memory_layout.setSpacing(15)
-        self.chk_hdr_local_dimming_memory = CheckBox("HDR/SDR 分区控光记忆", card3)
+        self.chk_hdr_local_dimming_memory = CheckBox(
+            f"HDR/SDR 分区控光记忆（{MEMORY_TAKEOVER_HINT}）", card3)
         self.chk_hdr_local_dimming_memory.setChecked(settings.get("hdr_sdr_local_dimming_enabled", False))
         self.chk_hdr_local_dimming_memory.stateChanged.connect(self._toggle_hdr_local_dimming_memory)
         hdr_memory_layout.addWidget(self.chk_hdr_local_dimming_memory)
@@ -977,7 +1328,8 @@ class PagesMixin:
 
         freesync_memory_layout = QHBoxLayout()
         freesync_memory_layout.setSpacing(15)
-        self.chk_freesync_mode_memory = CheckBox("FreeSync Pro 模式记忆", card3)
+        self.chk_freesync_mode_memory = CheckBox(
+            f"FreeSync Pro 模式记忆（{MEMORY_TAKEOVER_HINT}）", card3)
         self.chk_freesync_mode_memory.setChecked(settings.get("freesync_mode_memory_enabled", False))
         self.chk_freesync_mode_memory.stateChanged.connect(self._toggle_freesync_mode_memory)
         freesync_memory_layout.addWidget(self.chk_freesync_mode_memory)
@@ -1520,10 +1872,14 @@ class PagesMixin:
                         self.adb.refresh_pq(check=True)
                     if settings_keys:
                         for k in settings_keys: self.adb.put(k, str(v), check=True)
+            def success():
+                self.log(f"{title}: {v}")
+                self._note_picture_change()
+
             self._run_adb_action(
                 title,
                 operation,
-                lambda: self.log(f"{title}: {v}"),
+                success,
                 lambda: self._force_refresh_page("picturePage"),
             )
 

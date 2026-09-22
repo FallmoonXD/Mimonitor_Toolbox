@@ -38,6 +38,17 @@ def get_log_dir():
     """日志目录，跟随配置放在用户可写的 app-data 下（避免 exe 装在无写权限目录时失败）"""
     return os.path.join(get_app_data_dir(), "logs")
 
+def _as_list_of_dicts(raw):
+    """列表型配置字段的兜底：非 list、或含非 dict 的项，都按项丢弃。
+
+    只做结构校验；各项的**字段**语义（预设必带哪些键、时间段是否合法）
+    由 presets.py 在读取时校验，那里才知道 schema。
+    """
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
 def _load_settings_unlocked():
     defaults = {
         "close_behavior": "tray",
@@ -53,6 +64,18 @@ def _load_settings_unlocked():
         "tray_items": ["picture_mode", "local_dimming", "backlight"],
         "hotkey_countdown_enabled": True,
         "hotkey_countdown_seconds": 0.8,
+        # 预设：[{"id", "name", "values": {settings_key: value}}]
+        "presets": [],
+        # 自动任务：[{"id", "start": "HH:MM", "end": "HH:MM",
+        #             "preset_id", "snapshot": {...}|None}]
+        # snapshot 随任务自身存，不与 preset_snapshot 共用 —— 时间段内用户可能
+        # 手动套用别的预设，共用槽位会让时间段结束时的还原回到错误的状态。
+        "auto_tasks": [],
+        # 「无预设」下那份值：从无预设切到某个预设时存下来，点无预设的应用就还原它。
+        # None 表示当前没在用任何预设（= 无预设），此时画面页的改动不落进任何预设。
+        "preset_snapshot": None,
+        # 当前正在使用的预设 id；None = 无预设
+        "active_preset_id": None,
     }
     path = get_settings_path()
     data = {}
@@ -73,6 +96,12 @@ def _load_settings_unlocked():
         "sdr": memory.get("sdr"),
         "hdr": memory.get("hdr"),
     }
+    merged["presets"] = _as_list_of_dicts(merged.get("presets"))
+    merged["auto_tasks"] = _as_list_of_dicts(merged.get("auto_tasks"))
+    snapshot = merged.get("preset_snapshot")
+    merged["preset_snapshot"] = snapshot if isinstance(snapshot, dict) else None
+    active = merged.get("active_preset_id")
+    merged["active_preset_id"] = active if isinstance(active, str) and active else None
     return merged
 
 def load_settings():

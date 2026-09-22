@@ -4,7 +4,8 @@ import time
 
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor
-from qfluentwidgets import MessageBox, ToggleButton
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from qfluentwidgets import BodyLabel, MessageBox, ToggleButton
 
 from .adb import async_run
 from .core import (
@@ -20,7 +21,20 @@ from .core import (
     load_settings,
     update_settings,
 )
+from .presets import (
+    BASELINE_PRESET_ID,
+    PICTURE_ITEMS,
+    apply_preset,
+    find_active_task,
+    find_preset,
+    missing_keys,
+    new_id,
+    unique_name,
+)
+from .widgets import LoadingSpinner, OverlayResizeFilter
 from .windows import query_windows_hdr_enabled
+
+_preset_overlay_filter = None
 
 _GAME_FEATURE_DEPENDENCIES = {
     "mt_game_dynamic_ft": ("front_sight_index", 1, "准星 1"),
@@ -370,6 +384,7 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
+            self._note_picture_change()
             self.log(message)
             self.current_vals["picture_local_dimming"] = value
             self.current_vals["tv_picture_video_local_dimming"] = value
@@ -430,6 +445,7 @@ class DisplayFeaturesMixin:
                 self.adb.put("tv_picture_light_sensor", str(value), check=True)
 
         def success():
+            self._note_picture_change()
             self.log(message)
             self.current_vals["tv_picture_light_sensor"] = value
             self.current_vals["g_video__light_sensor_switch"] = value
@@ -441,6 +457,462 @@ class DisplayFeaturesMixin:
                 self._sync_light_sensor_switch(str(previous).strip() == "1")
 
         self._run_adb_action("自动调整亮度", operation, success, failure)
+
+    # ===== 预设：应用与恢复 =====
+
+    def _preset_suppress_seconds(self):
+        """应用预设期间压制自动动作的时长估计。
+
+        真正的串行保证来自 `adb.transaction()`：整批写入在一个事务里跑完，其它
+        ADB 动作（HDR 记忆 apply、快捷循环）只能等锁。这个时间窗是用来劝阻**新
+        排程**的，宁可给宽一点，也别让自动纠正插进批次中间。
+        """
+        return min(20.0, 4.0 + 0.9 * len(PICTURE_ITEMS))
+
+    def _preset_foreground(self):
+        """窗口是否在前台可见。收进托盘或最小化时算"后台服务"。"""
+        return bool(self.isVisible()) and not self.isMinimized()
+
+    def _show_preset_switching_overlay(self):
+        """全窗口遮罩 + 转圈，挡住切换期间的误操作。
+
+        挂在主窗口上而不是某一页 —— 切预设会连带改画面模式等，用户此刻可能
+        停在任意页面上。窗口在后台时不显示（看不见，也没有挡住的意义），改由
+        悬浮窗提示。
+
+        遮罩是**窗口特性**：宿主若不是 QWidget（单元测试里的轻量假宿主）
+        就直接跳过，不为了测试方便去给生产代码加一堆 getattr 兜底。
+        """
+        if not isinstance(self, QWidget):
+            return
+        self._hide_preset_switching_overlay()
+        if not self._preset_foreground():
+            osd = getattr(self, "osd", None)
+            if osd is not None:
+                osd.show_hud("正在切换预设", "请稍候")
+            return
+
+        overlay = QWidget(self)
+        overlay.setObjectName("_preset_overlay")
+        overlay.setStyleSheet("background-color: rgba(0, 0, 0, 120);")
+        overlay.setGeometry(self.rect())
+
+        column = QVBoxLayout(overlay)
+        column.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.setSpacing(14)
+        column.addWidget(LoadingSpinner(overlay), 0, Qt.AlignmentFlag.AlignHCenter)
+        label = BodyLabel("正在切换预设...", overlay)
+        label.setStyleSheet("color: white; font-size: 16px; background: transparent;")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(label, 0, Qt.AlignmentFlag.AlignCenter)
+
+        global _preset_overlay_filter
+        if _preset_overlay_filter is None:
+            _preset_overlay_filter = OverlayResizeFilter("_preset_overlay")
+        self.installEventFilter(_preset_overlay_filter)
+
+        overlay.show()
+        overlay.raise_()
+
+    def _hide_preset_switching_overlay(self):
+        if not isinstance(self, QWidget):
+            return
+        for child in self.findChildren(QWidget, "_preset_overlay"):
+            child.hide()
+            child.deleteLater()
+
+    def _apply_picture_values(self, values, label, before_apply=None,
+                              on_finished=None, quiet=False):
+        """把一组画面值按固定顺序写进设备（预设应用与快照恢复共用）。
+
+        `before_apply(snapshot)` 非 None 时，表示这是一次"覆盖式"应用：会先在
+        同一个事务里读一份当前值快照并交给回调落盘，供之后撤销。
+
+        `quiet=True` 供自动任务使用：未连接时静默放弃，不弹「未连接显示器」对话框
+        （那是给用户手动操作准备的提示，定时器不该弹窗）。
+
+        全程压制 HDR/SDR 记忆的自动纠正 —— 否则它会把自己的写入当成用户选择记下来，
+        甚至在批次中途插进来改精密控光。
+        """
+        if quiet:
+            if not getattr(self, "adb_connected", False):
+                self.log(f"{label} 已跳过：未连接显示器")
+                return
+        elif not self.check_connection():
+            return
+        seconds = self._preset_suppress_seconds()
+        self._mark_adb_busy(seconds)
+        self._local_dimming_memory_suppress_until = time.monotonic() + seconds
+        self._show_preset_switching_overlay()
+        outcome = {}
+
+        def operation():
+            with self.adb.transaction():
+                if before_apply is not None:
+                    before_apply(self._read_picture_values())
+                outcome["result"] = apply_preset(self.adb, values)
+
+        def success():
+            self._hide_preset_switching_overlay()
+            result = outcome.get("result")
+            if result is None:
+                return
+            self.log(f"{label}：{result.summary()}")
+            for name, reason in result.skipped:
+                self.log(f"  · 跳过 {name}（{reason}）")
+            for name, error in result.failed:
+                self.log(f"  · 失败 {name}：{error}")
+            self.current_vals.update(values)
+            self._page_loaded.discard("picturePage")
+            # FreeSync 在游戏页，预设会动它，那边的开关也得回读
+            self._page_loaded.discard("gamePage")
+            # 等设备把整批写入消化完再回读 —— 兼作"写入是否真的落下去"的校验，
+            # 因为模式切换会重新应用该模式的整套参数。
+            QTimer.singleShot(1800, self._verify_after_preset_apply)
+            if on_finished:
+                on_finished(result)
+
+        def failure(error):
+            self._hide_preset_switching_overlay()
+            self.log(f"{label} 失败：{error}")
+            if on_finished:
+                on_finished(None)
+
+        self._run_adb_action(label, operation, success, failure)
+
+    def _verify_after_preset_apply(self):
+        """应用后回读一次并刷新界面。"""
+        if getattr(self, "_cleanup_done", False) or not getattr(self, "adb_connected", False):
+            return
+        if self._adb_channel_busy():
+            QTimer.singleShot(800, self._verify_after_preset_apply)
+            return
+        self._refresh_pages(("picturePage", "gamePage"), force=True)
+
+    def _store_preset_snapshot(self, values, source):
+        return update_settings({"preset_snapshot": {
+            "source": source,
+            "values": values,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }})
+
+    def active_preset_id(self):
+        """当前正在使用的预设 id；None 表示「无预设」。"""
+        return load_settings().get("active_preset_id")
+
+    def memories_suspended_by_preset(self):
+        """有预设生效时，两个「记忆」暂停。
+
+        它们存在的理由是「没有预设时，用户没法为另一种状态预先存一套值」——
+        而预设正是那套预先存好的值。两者都在管同一件事，同时生效必然打架
+        （HDR 记忆会去写精密控光覆盖预设，且那个写入不会被预设吸收，
+        结果是设备值、画面页值、预设值三方不一致）。
+        """
+        return bool(self.active_preset_id())
+
+    def _refresh_preset_views(self):
+        """预设卡片与画面页的「当前预设」提示一起刷新。"""
+        if hasattr(self, "_preset_sync"):
+            self._preset_sync()
+        if hasattr(self, "_update_preset_banner"):
+            self._update_preset_banner()
+
+    def _goto_preset_page(self):
+        page = getattr(self, "preset_page", None)
+        if page is not None and hasattr(self, "stackedWidget"):
+            self.stackedWidget.setCurrentWidget(page)
+
+    def apply_preset_by_id(self, preset_id):
+        """套用一个预设，并把它记为「当前预设」。"""
+        preset = find_preset(load_settings().get("presets") or [], preset_id)
+        if preset is None:
+            self.log("预设不存在或已被删除")
+            return
+        values = preset.get("values") or {}
+        name = preset.get("name") or preset_id
+        missing = missing_keys(values)
+        if missing:
+            self.log(f"预设「{name}」缺 {len(missing)} 项（{'、'.join(missing)}），只应用已有的项")
+        # 只有从「无预设」切进预设时才更新那份值 —— 预设之间互切不该覆盖它，
+        # 否则「无预设」就不再是"套预设之前"的那套设置了。
+        leaving_baseline = not self.active_preset_id()
+
+        def remember(snapshot):
+            if leaving_baseline:
+                self._store_preset_snapshot(snapshot, name)
+
+        def finished(result):
+            if result is None:
+                return
+            update_settings({"active_preset_id": preset_id})
+            self._refresh_preset_views()
+
+        self._apply_picture_values(values, f"应用预设「{name}」",
+                                   before_apply=remember, on_finished=finished)
+
+    def restore_preset_snapshot(self):
+        """退回「无预设」：还原成套预设之前的那套值。"""
+        snapshot = load_settings().get("preset_snapshot")
+        if not isinstance(snapshot, dict) or not snapshot.get("values"):
+            self.log("还没有可退回的状态")
+            return
+
+        def finished(result):
+            if result is None:
+                return
+            update_settings({"active_preset_id": None})
+            self._refresh_preset_views()
+
+        self._apply_picture_values(snapshot["values"], "退回无预设", on_finished=finished)
+
+    def has_preset_snapshot(self):
+        snapshot = load_settings().get("preset_snapshot")
+        return bool(isinstance(snapshot, dict) and snapshot.get("values"))
+
+    # ===== 改动自动写回当前预设 =====
+
+    def _note_picture_change(self):
+        """画面设置被改动后，把结果同步进当前预设。
+
+        「无预设」时什么都不做 —— 那时改动就是改动本身，没有地方要存。
+        """
+        if not self.active_preset_id():
+            return
+        timer = getattr(self, "_preset_sync_timer", None)
+        if timer is not None:
+            timer.start()      # 单发定时器，重复 start 会把触发时间往后推（去抖）
+
+    def _sync_active_preset(self):
+        """回读设备当前值并写进当前预设，让预设始终等于设备实际状态。"""
+        preset_id = self.active_preset_id()
+        if not preset_id:
+            return
+        if getattr(self, "_cleanup_done", False) or not getattr(self, "adb_connected", False):
+            return
+        if self._adb_channel_busy():
+            timer = getattr(self, "_preset_sync_timer", None)
+            if timer is not None:
+                timer.start()
+            return
+        captured = {}
+
+        def operation():
+            captured["values"] = self._read_picture_values()
+
+        def success():
+            values = captured.get("values") or {}
+            if not values:
+                return
+            presets = load_settings().get("presets") or []
+            preset = find_preset(presets, preset_id)
+            if preset is None or preset.get("values") == values:
+                return
+            preset["values"] = values
+            update_settings({"presets": presets})
+            self.log(f"已把当前设置保存进预设「{preset.get('name')}」")
+            self._refresh_preset_views()
+
+        self._run_adb_action("保存到当前预设", operation, success)
+
+    # ===== 当前预设的展示与切换 =====
+
+    def _update_preset_banner(self):
+        """顶部指示条：当前有预设在用就显示，无预设则收起。
+
+        它只表达状态，不带按钮 —— 改动是自动写回当前预设的，没有"保存"要做；
+        想脱离预设就点卡片上的「无预设」。
+        """
+        banner = getattr(self, "_preset_banner", None)
+        if banner is None:
+            return
+        preset = find_preset(load_settings().get("presets") or [],
+                             self.active_preset_id() or "")
+        if preset is None:
+            banner.hide()
+            return
+        # 画面页那行「当前预设：X」撤掉了，那句「改动会自动保存进它」挪到这里 ——
+        # 否则用户不知道改动去哪了
+        banner.set_preset_name(preset.get("name") or preset.get("id"))
+        banner.show_banner()
+
+    def _goto_picture_page(self):
+        page = getattr(self, "picture_page", None)
+        if page is None or not hasattr(self, "stackedWidget"):
+            return
+        self.stackedWidget.setCurrentWidget(page)
+
+    def begin_preset_edit(self, preset_id):
+        """卡片上的「编辑」：切到该预设并跳到画面设置页去调。
+
+        没有"编辑会话"可言 —— 切过去之后它就是当前预设，之后在画面页的改动
+        会自动写回它。想反悔就点「无预设」退回套预设之前的值。
+        """
+        if not self.check_connection():
+            return
+        if self.active_preset_id() == preset_id:
+            # 已经是当前预设，直接跳过去调就行
+            self._goto_picture_page()
+            return
+        self.apply_preset_by_id(preset_id)
+        self._goto_picture_page()
+
+    def create_preset_from_current(self, name):
+        """新建预设：以**当前设备设置**为内容创建，并立刻切为当前预设。
+
+        没有"保存"按钮，所以创建必须在这一步完成；之后在画面页的调整会通过
+        自动保存继续写进它。
+        """
+        if not self.check_connection():
+            return
+        captured = {}
+
+        def operation():
+            captured["values"] = self._read_picture_values()
+
+        def success():
+            values = captured.get("values") or {}
+            if not values:
+                self.log("没能读到当前设置，预设未创建")
+                return
+            presets = load_settings().get("presets") or []
+            final_name = unique_name(presets, name)
+            created_id = new_id(presets, "preset")
+            presets.append({"id": created_id, "name": final_name, "values": values})
+            update_settings({"presets": presets, "active_preset_id": created_id})
+            self.log(f"已新建预设「{final_name}」，共 {len(values)} 项")
+            self._refresh_preset_views()
+            self._goto_picture_page()
+
+        self._run_adb_action("新建预设", operation, success)
+
+
+    # ===== 自动任务调度 =====
+
+    def initialize_preset_features(self):
+        from PyQt6.QtCore import QTimer as _QTimer
+
+        self._auto_task_checking = False
+        self._auto_task_active_id = None
+        self._auto_task_waiting_id = None
+        self._auto_task_timer = _QTimer(self)
+        self._auto_task_timer.setInterval(15000)
+        self._auto_task_timer.timeout.connect(self._auto_task_tick)
+        self._auto_task_timer.start()
+
+        # 改动写回当前预设的去抖定时器：滑条松手到真正回读之间留一段，
+        # 免得连点几个控件就来回读好几次设备。
+        self._preset_sync_timer = _QTimer(self)
+        self._preset_sync_timer.setSingleShot(True)
+        self._preset_sync_timer.setInterval(1200)
+        self._preset_sync_timer.timeout.connect(self._sync_active_preset)
+
+    def _auto_task_tick(self):
+        """每 15s 看一次当前时刻该由哪个任务生效。
+
+        未连接时**不放弃**：记下命中的任务待命，等连上后再看是否仍在该时间段内 ——
+        还在就补执行，已经出了时间段就自然什么都不做（下一次 tick 命中为空）。
+        """
+        if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
+            return
+        if self._auto_task_checking or self._adb_channel_busy():
+            return
+        self._auto_task_checking = True
+        try:
+            tasks = load_settings().get("auto_tasks") or []
+            now = time.localtime()
+            active = find_active_task(tasks, now.tm_hour * 60 + now.tm_min)
+            active_id = active.get("id") if active else None
+            if active_id == self._auto_task_active_id:
+                return
+
+            if active is None:
+                finished = self._auto_task_active_id
+                self._auto_task_active_id = None
+                self._auto_task_waiting_id = None
+                if finished:
+                    self._end_auto_task(finished)
+                return
+
+            if not getattr(self, "adb_connected", False):
+                if self._auto_task_waiting_id != active_id:
+                    self._auto_task_waiting_id = active_id
+                    self.log("自动任务的时段已到，但显示器未连接，等连上后再看是否仍在时段内")
+                return
+
+            self._auto_task_waiting_id = None
+            self._auto_task_active_id = active_id
+            self._start_auto_task(active)
+        finally:
+            self._auto_task_checking = False
+
+    def _find_task(self, task_id):
+        for task in load_settings().get("auto_tasks") or []:
+            if isinstance(task, dict) and task.get("id") == task_id:
+                return task
+        return None
+
+    def _start_auto_task(self, task):
+        preset_id = task.get("preset_id")
+        window = f"（{task.get('start')}-{task.get('end')}）"
+        if preset_id == BASELINE_PRESET_ID:
+            # 「无预设」也能排任务：这段时间内不使用任何预设，退回套预设之前的值
+            values = (load_settings().get("preset_snapshot") or {}).get("values") or {}
+            if not values:
+                self.log(f"自动任务{window}要改用「无预设」，但还没有可退回的状态")
+                return
+            name = "无预设"
+            label = "自动任务：改用无预设"
+            target_active = None
+        else:
+            preset = find_preset(load_settings().get("presets") or [], preset_id)
+            if preset is None:
+                self.log(f"自动任务{window}引用的预设已不存在")
+                return
+            values = preset.get("values") or {}
+            name = preset.get("name") or preset_id
+            label = f"自动任务：{name}"
+            target_active = preset_id
+        self.log(f"{label}{window}")
+        task_id = task.get("id")
+
+        def remember(snapshot):
+            # 快照存进任务自身，不共用 preset_snapshot —— 时段内用户可能手动套用了
+            # 别的预设，共用槽位会让时段结束时的还原回到错误的状态。
+            tasks = load_settings().get("auto_tasks") or []
+            for item in tasks:
+                if isinstance(item, dict) and item.get("id") == task_id:
+                    item["snapshot"] = {"values": snapshot, "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+            update_settings({"auto_tasks": tasks})
+
+        def finished(result):
+            if result is None:
+                return
+            update_settings({"active_preset_id": target_active})
+            if hasattr(self, "_refresh_preset_views"):
+                self._refresh_preset_views()
+
+        self._apply_picture_values(values, label, before_apply=remember,
+                                   on_finished=finished, quiet=True)
+
+    def _clear_task_snapshot(self, task_id):
+        tasks = load_settings().get("auto_tasks") or []
+        for item in tasks:
+            if isinstance(item, dict) and item.get("id") == task_id:
+                item["snapshot"] = None
+        update_settings({"auto_tasks": tasks})
+
+    def _end_auto_task(self, task_id):
+        task = self._find_task(task_id)
+        snapshot = task.get("snapshot") if isinstance(task, dict) else None
+        values = snapshot.get("values") if isinstance(snapshot, dict) else None
+        if not values:
+            self.log("自动任务时段结束，但没有记录到可还原的快照")
+            self._clear_task_snapshot(task_id)
+            return
+        self.log("自动任务时段结束，正在还原之前的设置")
+        self._clear_task_snapshot(task_id)
+        # 不动 preset_snapshot —— 那是"手动应用预设"的撤销槽，自动任务不该覆盖它。
+        self._apply_picture_values(values, "自动任务结束：还原设置", quiet=True)
 
     def trigger_adjust_hotkey(self, rule):
         if not getattr(self, "adb_connected", False):
@@ -601,10 +1073,14 @@ class DisplayFeaturesMixin:
                 for k in settings_keys:
                     self.adb.put(k, str(value), check=True)
 
+        def success():
+            self.log(f"{cfg['label']}: {value}")
+            self._note_picture_change()
+
         self._run_adb_action(
             cfg["label"],
             do,
-            lambda: self.log(f"{cfg['label']}: {value}"),
+            success,
             lambda: self._force_refresh_page("picturePage"),
         )
 
@@ -1004,6 +1480,8 @@ class DisplayFeaturesMixin:
         timer.start(delay_ms)
 
     def _apply_hdr_memory_for_current_state(self):
+        if self.memories_suspended_by_preset():
+            return
         if not self._hdr_memory_enabled() or not getattr(self, "adb_connected", False):
             return
         state = getattr(self, "_hdr_last_state", None)
@@ -1112,6 +1590,10 @@ class DisplayFeaturesMixin:
 
     def _remember_local_dimming_value(self, value, log_change=True, force_bucket=None):
         if not self._hdr_memory_enabled():
+            return
+        if self.memories_suspended_by_preset():
+            # 预设生效期间记忆是冻结的：既不去改设备，也不吸收预设的值 ——
+            # 否则停用预设后它会拿一堆预设的值当作"用户偏好"去还原。
             return
         if not log_change:
             return
@@ -1266,6 +1748,7 @@ class DisplayFeaturesMixin:
             self.adb.put("picture_mode", str(val), check=True)
 
         def success():
+            self._note_picture_change()
             self.current_vals["picture_mode"] = val
             self._highlight_mode(val)
             self.log(f"模式: {name}")
@@ -1312,6 +1795,7 @@ class DisplayFeaturesMixin:
                     self.adb.refresh_pq(check=True)
 
             def success():
+                self._note_picture_change()
                 self.log(f"已恢复 {mode_name} 模式默认设置，等待生效...")
                 self._page_loaded.discard("picturePage")
                 QTimer.singleShot(3000, lambda: self._refresh_page_data("picturePage"))
@@ -1460,6 +1944,7 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
+            self._note_picture_change()
             self.log(m)
             self.current_vals[sk] = v
             if osd_sk:
@@ -1497,6 +1982,7 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
+            self._note_picture_change()
             self.log(f"HDR 色调映射: {name}")
             self.current_vals["picture_hdr_tone_mapping"] = mtk_value
             self.current_vals[state_key] = ui_value
@@ -1521,6 +2007,7 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
+            self._note_picture_change()
             self.log(m)
             self.current_vals["picture_color_temperature"] = sv
             self._optimistic_highlight("picture_color_temperature", sv)
@@ -1581,6 +2068,7 @@ class DisplayFeaturesMixin:
                 self.adb.refresh_pq(check=True)
 
         def success():
+            self._note_picture_change()
             self.log(f"{title}: {value}")
 
         def failure():
@@ -1644,7 +2132,7 @@ class DisplayFeaturesMixin:
 
         # FreeSync Pro 模式记忆：开启前记录画面模式，关闭时切回（开启后显示器会自动切到游戏模式）
         restore_mode = None
-        if self._freesync_mode_memory_enabled():
+        if self._freesync_mode_memory_enabled() and not self.memories_suspended_by_preset():
             if on:
                 # 仅在从关到开时记录，避免重复开启把记忆覆盖成游戏模式
                 if self.current_vals.get("freesync") != 1:
@@ -1665,6 +2153,8 @@ class DisplayFeaturesMixin:
         def success():
             self.log(f"FreeSync: {'开' if on else '关'}")
             self.current_vals["freesync"] = 1 if on else 0
+            # FreeSync 在预设范围内，手动开关要写回当前预设
+            self._note_picture_change()
             self._optimistic_highlight("freesync", 1 if on else 0)
             if not on and restore_mode is not None:
                 self.current_vals["picture_mode"] = restore_mode

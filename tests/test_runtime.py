@@ -1209,6 +1209,10 @@ class StateMachineTests(unittest.TestCase):
             def _optimistic_highlight(self, key, value):
                 calls.append(("highlight", key, value))
 
+            def _note_picture_change(self):
+                # 画面设置改动后会把结果同步进当前预设；这里只关心下发本身
+                pass
+
             def log(self, message):
                 calls.append(("log", message))
 
@@ -1248,6 +1252,9 @@ class StateMachineTests(unittest.TestCase):
         class FakeApp:
             def _hdr_memory_enabled(self):
                 return True
+
+            def memories_suspended_by_preset(self):
+                return False
 
             def _save_local_dimming_memory(self, memory):
                 raise AssertionError("automatic refresh must not save memory")

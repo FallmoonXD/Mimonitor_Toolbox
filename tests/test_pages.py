@@ -6,9 +6,18 @@ import _isolation  # noqa: F401  配置隔离：见 tests/_isolation.py
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QPoint, QSize, Qt
+from PyQt6.QtCore import QPoint, QSize, QTime, Qt
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QAbstractButton, QApplication
+from PyQt6.QtWidgets import QAbstractButton, QApplication, QLabel, QWidget
+from qfluentwidgets import PrimaryPushButton, TransparentToolButton
+
+from mimonitor_toolbox.pages import BASELINE_PRESET_ID
+from mimonitor_toolbox.widgets import (
+    AddPresetCard,
+    AddTaskCard,
+    AutoTaskCard,
+    PresetCard,
+)
 
 
 _qt_application = QApplication.instance() or QApplication([])
@@ -48,7 +57,8 @@ class TrayTestBase(unittest.TestCase):
         # 停掉周期定时器再销毁。只 deleteLater 的话，这些定时器在对象真正被回收
         # 之前还会响 —— 实测会漏进 test_runtime 的进程计数里（那边统计整个窗口期
         # 内的所有 Popen 调用，多出几次就断言失败）。
-        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer"):
+        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer",
+                     "_auto_task_timer"):
             timer = getattr(window, name, None)
             if timer is not None:
                 timer.stop()
@@ -80,6 +90,9 @@ class PageContractTests(unittest.TestCase):
             "_make_game_page",
             "_make_source_page",
             "_make_light_page",
+            "_make_tray_page",
+            "_make_preset_page",
+            "_make_auto_task_page",
             "_make_tools_page",
             "_make_remote_page",
             "_add_slider",
@@ -263,7 +276,8 @@ class CountdownSettingsUiTests(TrayTestBase):
         if window is None:
             return
         window._cleanup_done = True
-        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer"):
+        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer",
+                     "_auto_task_timer"):
             timer = getattr(window, name, None)
             if timer is not None:
                 timer.stop()
@@ -793,6 +807,499 @@ class TrayPageTests(TrayTestBase):
             widget.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._close(window)
+
+
+class PresetAndTaskPageTests(TrayTestBase):
+    """预设模式页与自动任务页。
+
+    pages.py 自己也 import 了 load_settings（预设列表要读它），所以这里除了
+    基类的 `_settings_patches`，还要单独 patch pages 模块的读写。
+    """
+
+    def _window(self, settings):
+        from mimonitor_toolbox import display_features as display_module
+        from mimonitor_toolbox import pages as pages_module
+        from mimonitor_toolbox.main_window import App
+
+        # message_signal 在 __init__ 里连到 _show_message_box，那是个**模态框** ——
+        # 校验失败的分支会把它弹出来把测试挂死。在构造时就打桩：信号连的是当时的
+        # 那个对象，之后一直是它，所以构造期打桩就够了。
+        with mock.patch.object(App, "_show_message_box"):
+            window = self._app()
+        # 三个模块都读配置：pages 建卡片、display_features 判断「有没有快照」、
+        # main_window 管生命周期。漏掉任何一个，那条路径就会去读临时配置，
+        # 测试里看到的状态和 settings 对不上。
+        patches = [
+            mock.patch.object(pages_module, "load_settings",
+                              side_effect=lambda: dict(settings)),
+            mock.patch.object(pages_module, "update_settings",
+                              side_effect=settings.update),
+            mock.patch.object(display_module, "load_settings",
+                              side_effect=lambda: dict(settings)),
+            mock.patch.object(display_module, "update_settings",
+                              side_effect=settings.update),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        # addCleanup 是后进先出：先关窗口，再撤 patch
+        self.addCleanup(self._close, window)
+        window._preset_sync()
+        return window
+
+    @staticmethod
+    def _run_inline(label, operation, on_success=None, on_failure=None):
+        operation()
+        if on_success:
+            on_success()
+
+    # ── 页面挂载 ──
+
+    def test_both_pages_have_their_own_routes(self):
+        window = self._window({})
+        self.assertEqual(window.preset_page.objectName(), "presetPage")
+        self.assertEqual(window.auto_task_page.objectName(), "autoTaskPage")
+
+    def _cards(self, window):
+        """按顺序取出卡片网格里的控件。"""
+        flow = window.preset_flow_host.flow()
+        return [flow.itemAt(i).widget() for i in range(flow.count())]
+
+    @staticmethod
+    def _texts(card):
+        """卡片上所有文字。名字是 BodyLabel、说明是 CaptionLabel，都算 QLabel。"""
+        return [w.text() for w in card.findChildren(QLabel)]
+
+    def _card_id(self, window, preset_id):
+        for card in self._cards(window):
+            if isinstance(card, PresetCard) and card.preset_id == preset_id:
+                return card
+        self.fail(f"没找到 id 为 {preset_id} 的卡片")
+
+    def test_cards_live_on_the_preset_page(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        for card in self._cards(window):
+            self.assertTrue(window.preset_page.isAncestorOf(card))
+            self.assertFalse(window.auto_task_page.isAncestorOf(card))
+
+    # ── 卡片网格 ──
+
+    def test_grid_is_baseline_then_presets_then_add_card(self):
+        settings = {"presets": [
+            {"id": "p1", "name": "看电影", "values": {}},
+            {"id": "p2", "name": "打游戏", "values": {}},
+        ]}
+        window = self._window(settings)
+        cards = self._cards(window)
+        self.assertEqual(len(cards), 4)                      # 无预设 + 2 + 添加
+        self.assertIsInstance(cards[0], PresetCard)
+        self.assertEqual(cards[0].preset_id, BASELINE_PRESET_ID)
+        self.assertEqual([c.preset_id for c in cards[1:3]], ["p1", "p2"])
+        self.assertIsInstance(cards[3], AddPresetCard)
+
+    def test_empty_state_shows_baseline_and_add_card(self):
+        """没有预设时也要有无预设卡和 + 卡。"""
+        window = self._window({})
+        cards = self._cards(window)
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(cards[0].preset_id, BASELINE_PRESET_ID)
+        self.assertIsInstance(cards[1], AddPresetCard)
+
+    def test_preset_card_shows_name_and_value_count(self):
+        settings = {"presets": [{"id": "p1", "name": "看电影",
+                                 "values": {"picture_mode": 9, "picture_contrast": 70}}]}
+        window = self._window(settings)
+        card = self._card_id(window, "p1")
+        texts = self._texts(card)
+        self.assertIn("看电影", texts)
+        self.assertTrue(any("2 项" in t for t in texts))
+
+    def test_preset_card_emits_apply_and_edit(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        applied, edited = [], []
+        window._preset_apply = lambda pid: applied.append(pid)
+        window._preset_edit = lambda pid: edited.append(pid)
+        # 重新建卡以接上新的回调
+        window._preset_sync()
+        card = self._card_id(window, "p1")
+        card.apply_requested.emit("p1")
+        card.edit_requested.emit("p1")
+        self.assertEqual(applied, ["p1"])
+        self.assertEqual(edited, ["p1"])
+
+    # ── 无预设卡 ──
+
+    def test_baseline_apply_disabled_without_snapshot(self):
+        window = self._window({})
+        self.assertFalse(self._apply_button(window, BASELINE_PRESET_ID).isEnabled())
+        card = self._card_id(window, BASELINE_PRESET_ID)
+        self.assertTrue(any("不使用任何预设" in t for t in self._texts(card)))
+
+    def test_baseline_apply_enabled_when_a_preset_is_in_use(self):
+        """正在用某个预设时，无预设那张才可点（点它 = 退回去）。"""
+        settings = {"active_preset_id": "p1",
+                    "preset_snapshot": {"source": "看电影",
+                                        "values": {"picture_mode": 9},
+                                        "at": "2026-09-22 20:00:00"},
+                    "presets": [{"id": "p1", "name": "测试", "values": {}}]}
+        window = self._window(settings)
+        card = self._card_id(window, BASELINE_PRESET_ID)
+        self.assertTrue(self._apply_button(window, BASELINE_PRESET_ID).isEnabled())
+        # 卡片只说状态，动作说明在 tooltip 里
+        self.assertIn("不使用任何预设", self._texts(card))
+        self.assertIn("看电影", card.toolTip())
+
+    def test_baseline_apply_restores_the_snapshot(self):
+        # 得先有个预设正在用，无预设那张才可点（点它 = 退回去）
+        settings = {"active_preset_id": "p1",
+                    "preset_snapshot": {"source": "看电影",
+                                        "values": {"picture_mode": 9}},
+                    "presets": [{"id": "p1", "name": "测试", "values": {}}]}
+        window = self._window(settings)
+        restored = []
+        with mock.patch.object(window, "restore_preset_snapshot",
+                               side_effect=lambda: restored.append(True)):
+            self._card_id(window, BASELINE_PRESET_ID).findChild(
+                PrimaryPushButton).click()
+        self.assertEqual(restored, [True])
+
+    # ── 新建 / 编辑 ──
+
+    def test_add_card_prompts_for_a_name_then_creates_the_preset(self):
+        """新建必须在命名后立刻完成 —— 没有保存按钮，之后靠自动保存续写。"""
+        from mimonitor_toolbox import pages as pages_module
+
+        window = self._window({})
+        created = []
+        with mock.patch.object(pages_module, "PresetNameDialog") as dialog, \
+                mock.patch.object(window, "create_preset_from_current",
+                                  side_effect=created.append):
+            dialog.return_value.exec.return_value = True
+            dialog.return_value.preset_name.return_value = "我的预设"
+            self._cards(window)[-1].clicked.emit()
+        self.assertEqual(created, ["我的预设"])
+
+    def test_add_card_cancelled_creates_nothing(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        window = self._window({})
+        created = []
+        with mock.patch.object(pages_module, "PresetNameDialog") as dialog, \
+                mock.patch.object(window, "create_preset_from_current",
+                                  side_effect=created.append):
+            dialog.return_value.exec.return_value = False      # 取消
+            self._cards(window)[-1].clicked.emit()
+        self.assertEqual(created, [])
+
+    def test_edit_button_enters_edit_with_that_preset(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        started = []
+        with mock.patch.object(window, "begin_preset_edit",
+                               side_effect=lambda **kw: started.append(kw)):
+            self._card_id(window, "p1").edit_requested.emit("p1")
+        self.assertEqual(started, [{"preset_id": "p1"}])
+
+    # ── 右键菜单：重命名 / 删除 ──
+
+    def test_rename_updates_the_name(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "旧名", "values": {}}]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "PresetNameDialog") as dialog:
+            dialog.return_value.exec.return_value = True
+            dialog.return_value.preset_name.return_value = "新名"
+            window._preset_rename("p1")
+        self.assertEqual(settings["presets"][0]["name"], "新名")
+
+    def test_rename_to_duplicate_gets_a_suffix(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "重名", "values": {}},
+                                {"id": "p2", "name": "别的", "values": {}}]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "PresetNameDialog") as dialog:
+            dialog.return_value.exec.return_value = True
+            dialog.return_value.preset_name.return_value = "重名"
+            window._preset_rename("p2")
+        self.assertEqual(settings["presets"][1]["name"], "重名 (2)")
+
+    def test_delete_removes_the_preset(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = True
+            window._preset_delete("p1")
+        self.assertEqual(settings["presets"], [])
+        self.assertEqual(len(self._cards(window)), 2)        # 无预设 + 添加
+
+    def test_cancelled_delete_keeps_the_preset(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = False
+            window._preset_delete("p1")
+        self.assertEqual(len(settings["presets"]), 1)
+
+    def test_delete_warns_about_referencing_tasks(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {
+            "presets": [{"id": "p1", "name": "A", "values": {}}],
+            "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00", "preset_id": "p1"}],
+        }
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = False
+            window._preset_delete("p1")
+        self.assertIn("自动任务", box.call_args.args[1])
+
+    # ── 自动任务：卡片即列表 ──
+
+    def _apply_button(self, window, preset_id):
+        return self._card_id(window, preset_id).findChild(PrimaryPushButton)
+
+    def _task_cards(self, window):
+        layout = window.auto_task_cards_layout
+        widgets = [layout.itemAt(i).widget() for i in range(layout.count())]
+        return [w for w in widgets if isinstance(w, AutoTaskCard)]
+
+    def _task_card(self, window, task_id):
+        for card in self._task_cards(window):
+            if card.task_id == task_id:
+                return card
+        self.fail(f"没找到 id 为 {task_id} 的任务卡片")
+
+    def test_one_card_per_task_plus_the_add_card(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [
+                        {"id": "t1", "start": "08:00", "end": "10:00", "preset_id": "p1"},
+                        {"id": "t2", "start": "20:00", "end": "22:00", "preset_id": "p1"},
+                    ]}
+        window = self._window(settings)
+        self.assertEqual([c.task_id for c in self._task_cards(window)], ["t1", "t2"])
+        layout = window.auto_task_cards_layout
+        last = layout.itemAt(layout.count() - 1).widget()
+        self.assertIsInstance(last, AddTaskCard)
+
+    def test_no_separate_task_list_widget_exists(self):
+        """卡片本身就是列表。"""
+        window = self._window({})
+        self.assertFalse(hasattr(window, "auto_task_list"))
+
+    def test_card_shows_the_referenced_preset(self):
+        settings = {"presets": [{"id": "p1", "name": "看电影", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "20:00", "end": "22:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        card = self._task_card(window, "t1")
+        self.assertEqual(card.start_button.text(), "20:00")
+        self.assertEqual(card.end_button.text(), "22:00")
+        self.assertEqual(card.preset_combo.currentText(), "看电影")
+
+    def test_card_flags_a_deleted_preset(self):
+        settings = {"presets": [],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "gone"}]}
+        window = self._window(settings)
+        self.assertIn("已不存在", self._task_card(window, "t1").preset_combo.currentText())
+
+    def test_baseline_is_always_the_first_preset_option(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        combo = self._task_card(window, "t1").preset_combo
+        self.assertEqual(combo.itemText(0), "无预设")
+        self.assertEqual(combo.itemData(0), BASELINE_PRESET_ID)
+
+    def test_baseline_can_be_chosen_even_with_no_presets(self):
+        """没有预设时也能建任务 —— 只是「无预设」这一个选项。"""
+        settings = {"presets": [],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": BASELINE_PRESET_ID}]}
+        window = self._window(settings)
+        combo = self._task_card(window, "t1").preset_combo
+        self.assertEqual(combo.currentData(), BASELINE_PRESET_ID)
+
+    # ── 新增 / 编辑 / 保存 / 删除 ──
+
+    def test_add_creates_a_task_and_enters_edit_mode(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        self._task_cards(window)                      # 触发一次同步
+        window._auto_task_add()
+
+        tasks = settings["auto_tasks"]
+        self.assertEqual(len(tasks), 1)
+        self.assertIsNone(tasks[0]["snapshot"])
+        self.assertEqual(tasks[0]["preset_id"], "p1")
+        card = self._task_card(window, tasks[0]["id"])
+        self.assertTrue(card.is_editing(), "新建的那条该直接进编辑态")
+        self.assertEqual(card.action_button.text(), "保存")
+
+    def test_add_falls_back_to_baseline_when_no_presets(self):
+        settings = {}
+        window = self._window(settings)
+        window._auto_task_add()
+        self.assertEqual(settings["auto_tasks"][0]["preset_id"], BASELINE_PRESET_ID)
+
+    def test_card_starts_read_only_and_edit_unlocks_it(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        card = self._task_card(window, "t1")
+        self.assertFalse(card.is_editing())
+        self.assertFalse(card.start_button.isEnabled())
+        self.assertEqual(card.action_button.text(), "编辑")
+
+        card.action_button.click()                    # 编辑
+        self.assertTrue(card.is_editing())
+        self.assertTrue(card.start_button.isEnabled())
+        self.assertEqual(card.action_button.text(), "保存")
+
+    def test_saving_writes_the_row_values(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}},
+                                {"id": "p2", "name": "B", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        card = self._task_card(window, "t1")
+        card.action_button.click()                          # 编辑
+        card.set_time("start", QTime(9, 30))
+        card.preset_combo.setCurrentIndex(card.preset_combo.findData("p2"))
+        card.action_button.click()                          # 保存
+
+        task = settings["auto_tasks"][0]
+        self.assertEqual(task["start"], "09:30")
+        self.assertEqual(task["preset_id"], "p2")
+        self.assertIsNone(window._auto_task_editing_id)
+        # 保存后回到只读态，卡片也重建过
+        self.assertEqual(self._task_card(window, "t1").action_button.text(), "编辑")
+
+    def test_card_values_track_the_picked_time_not_the_label(self):
+        """真值在卡片的 QTime 上，按钮文字只是显示，不该反过来当数据源。"""
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        card = self._task_card(window, "t1")
+        card.set_time("start", QTime(7, 15))
+        self.assertEqual(card.values()["start"], "07:15")
+        self.assertEqual(card.start_button.text(), "07:15")
+
+    def test_saving_rejects_equal_start_and_end(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        warnings = []
+        window.message_signal.connect(lambda *args: warnings.append(args))
+        window._auto_task_save("t1", {"start": "09:00", "end": "09:00", "preset_id": "p1"})
+        self.assertTrue(warnings)
+        self.assertEqual(settings["auto_tasks"][0]["start"], "08:00")
+
+    def test_saving_does_not_append_a_new_task(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        window._auto_task_save("t1", {"start": "07:00", "end": "09:00", "preset_id": "p1"})
+        self.assertEqual(len(settings["auto_tasks"]), 1)
+
+    def test_overlapping_tasks_are_allowed(self):
+        """重叠不做保存期拦截 —— 由调度器按「靠下者生效」决定谁赢。"""
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        window._auto_task_add()
+        window._auto_task_add()
+        self.assertEqual(len(settings["auto_tasks"]), 2)
+
+    def test_deleting_a_task_removes_only_that_one(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [
+                        {"id": "t1", "start": "08:00", "end": "10:00", "preset_id": "p1"},
+                        {"id": "t2", "start": "20:00", "end": "22:00", "preset_id": "p1"},
+                    ]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = True
+            window._auto_task_delete("t1")
+        self.assertEqual([t["id"] for t in settings["auto_tasks"]], ["t2"])
+        self.assertEqual([c.task_id for c in self._task_cards(window)], ["t2"])
+
+    def test_cancelled_delete_keeps_the_task(self):
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = False
+            window._auto_task_delete("t1")
+        self.assertEqual(len(settings["auto_tasks"]), 1)
+
+    def test_repeated_sync_does_not_stack_stale_task_cards(self):
+        """和预设卡片同一个坑：摘出布局不等于销毁。"""
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "p1"}]}
+        window = self._window(settings)
+        for _ in range(4):
+            window._auto_task_sync()
+        alive = [w for w in window.auto_task_cards_host.findChildren(QWidget)
+                 if isinstance(w, (AutoTaskCard, AddTaskCard))]
+        self.assertEqual(len(alive), window.auto_task_cards_layout.count())
+        self.assertEqual(len(alive), 2)               # 1 条任务 + 添加卡
+
+
+    # ── 卡片右上角的图标按钮 ──
+
+    def test_card_icon_buttons_trigger_rename_and_delete(self):
+        """重命名/删除做成右上角的图标按钮，不是右键菜单 —— 右键没有可发现性。"""
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}]}
+        window = self._window(settings)
+        renamed, deleted = [], []
+        window._preset_rename = lambda pid: renamed.append(pid)
+        window._preset_delete = lambda pid: deleted.append(pid)
+        window._preset_sync()          # 重建卡片以接上新的回调
+
+        buttons = {b.toolTip(): b for b in
+                   self._card_id(window, "p1").findChildren(TransparentToolButton)}
+        self.assertEqual(sorted(buttons), ["删除", "重命名"])
+        buttons["重命名"].click()
+        buttons["删除"].click()
+        self.assertEqual(renamed, ["p1"])
+        self.assertEqual(deleted, ["p1"])
+
+    def test_baseline_card_has_no_rename_or_delete_buttons(self):
+        """「无预设」不是真预设，没有可改名/可删的东西。"""
+        window = self._window({})
+        card = self._card_id(window, BASELINE_PRESET_ID)
+        self.assertEqual(card.findChildren(TransparentToolButton), [])
+
+    def test_active_state_is_the_button_label_not_a_corner_badge(self):
+        """「已应用」靠「应用」按钮置灰改写来表达，不另画角标。"""
+        settings = {"active_preset_id": "p2",
+                    "presets": [{"id": "p1", "name": "A", "values": {}},
+                                {"id": "p2", "name": "B", "values": {}}]}
+        window = self._window(settings)
+        for card in self._cards(window):
+            if hasattr(card, "findChildren"):
+                self.assertNotIn("已应用", self._texts(card)[1:],
+                                 "除了应用按钮，卡片上不该再出现「已应用」字样")
+
 
 
 if __name__ == "__main__":

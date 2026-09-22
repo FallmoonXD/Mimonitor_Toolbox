@@ -9,7 +9,12 @@ import time
 
 from PyQt6.QtCore import QRect, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPixmap
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QMenu,
+    QSystemTrayIcon,
+)
 from qfluentwidgets import (
     Action,
     FluentIcon as FIF,
@@ -45,6 +50,7 @@ from .pages import PagesMixin
 from .widgets import (
     CloseConfirmDialog,
     OsdHud,
+    CurrentPresetBanner,
     TrayMenu,
     TrayOptionMenu,
     TraySliderCard,
@@ -155,6 +161,11 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.hdr_memory_timer.setInterval(3000)
         self.hdr_memory_timer.timeout.connect(lambda: self._poll_hdr_memory_state("timer"))
         self.hdr_memory_timer.start()
+        self.initialize_preset_features()
+        self._preset_sync()
+        # 顶部指示条：显示当前使用的预设（无按钮）
+        self._preset_banner = CurrentPresetBanner(self)
+        QTimer.singleShot(0, self._update_preset_banner)
         QTimer.singleShot(0, self._update_hdr_memory_status_label)
         QTimer.singleShot(0, self._update_freesync_memory_status_label)
         QTimer.singleShot(900, self._auto_connect_on_startup)
@@ -509,6 +520,16 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
                 self.adb_keepalive_timer.stop()
             if hasattr(self, "adb_server_monitor_timer"):
                 self.adb_server_monitor_timer.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_auto_task_timer"):
+                self._auto_task_timer.stop()
+            if hasattr(self, "_preset_sync_timer"):
+                self._preset_sync_timer.stop()
+            banner = getattr(self, "_preset_banner", None)
+            if banner is not None:
+                banner.hide()
         except Exception:
             pass
         try:

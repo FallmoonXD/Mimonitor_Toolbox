@@ -48,14 +48,24 @@ from qfluentwidgets import (
     CheckableMenu,
     MenuAnimationType,
     CheckBox,
+    ComboBox,
     FluentIcon as FIF,
+    FlowLayout,
+    Flyout,
+    FlyoutAnimationType,
+    FlyoutViewBase,
     IconWidget,
+    LineEdit,
+    MessageBoxBase,
     PrimaryPushButton,
     PushButton,
     RoundMenu,
+    SimpleCardWidget,
     Slider,
     SubtitleLabel,
     SystemTrayMenu,
+    TimePicker,
+    TransparentToolButton,
     Theme,
     drawIcon,
     isDarkTheme,
@@ -65,9 +75,20 @@ from qfluentwidgets.common import getFont
 from .windows import user32
 
 class OverlayResizeFilter(QObject):
+    """让遮罩跟随宿主尺寸。
+
+    `name` 可指定要跟随的 objectName —— 页面级刷新遮罩（`_loading_overlay`）
+    装在页面上，而切换预设的全窗口遮罩（`_preset_overlay`）装在主窗口上。
+    两者必须用各自的过滤器实例：装错了会把对方那一层的遮罩按自己的 rect 拉伸。
+    """
+
+    def __init__(self, name="_loading_overlay", parent=None):
+        super().__init__(parent)
+        self._name = name
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Resize:
-            for child in obj.findChildren(QWidget, "_loading_overlay"):
+            for child in obj.findChildren(QWidget, self._name):
                 child.setGeometry(obj.rect())
         return super().eventFilter(obj, event)
 class TraySliderRow(QWidget):
@@ -1144,3 +1165,470 @@ class InstallProgressDialog(QDialog):
 
         text_layout.addWidget(desc)
         layout.addLayout(text_layout, 1)
+
+
+# ===== 预设卡片 =====
+
+PRESET_CARD_WIDTH = 240
+PRESET_CARD_HEIGHT = 140
+
+
+class PresetCard(SimpleCardWidget):
+    """预设卡片。
+
+    顶行是名字 + 右上角的重命名 / 删除图标（做成图标按钮而不是右键菜单 ——
+    右键没有可发现性）；底行是「应用 / 编辑」。当前生效的那张，它的「应用」
+    按钮会置灰并改写成「已应用」，不再另画角标。
+    """
+
+    apply_requested = pyqtSignal(str)
+    edit_requested = pyqtSignal(str)
+    rename_requested = pyqtSignal(str)
+    delete_requested = pyqtSignal(str)
+
+    def __init__(self, preset_id, name, caption, parent=None, apply_enabled=True,
+                 editable=True, active=False, managed=True):
+        super().__init__(parent)
+        self.preset_id = preset_id
+        self.setFixedSize(PRESET_CARD_WIDTH, PRESET_CARD_HEIGHT)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 8, 12)
+        layout.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        name_label = BodyLabel(name, self)
+        font = name_label.font()
+        font.setPointSize(font.pointSize() + 1)
+        font.setBold(True)
+        name_label.setFont(font)
+        name_label.setWordWrap(True)
+        top.addWidget(name_label, 1)
+        if managed:
+            top.addWidget(self._make_icon_button(FIF.EDIT, "重命名", self.rename_requested),
+                          0, Qt.AlignmentFlag.AlignTop)
+            top.addWidget(self._make_icon_button(FIF.DELETE, "删除", self.delete_requested),
+                          0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(top)
+
+        caption_label = CaptionLabel(caption, self)
+        caption_label.setWordWrap(True)
+        layout.addWidget(caption_label)
+        layout.addStretch(1)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addStretch(1)
+        apply_btn = PrimaryPushButton("已应用" if active else "应用", self)
+        apply_btn.setFixedWidth(72)
+        apply_btn.setEnabled(apply_enabled and not active)
+        apply_btn.setToolTip("当前正在使用的就是这个" if active else "")
+        apply_btn.clicked.connect(lambda: self.apply_requested.emit(self.preset_id))
+        row.addWidget(apply_btn)
+        if editable:
+            edit_btn = PushButton("编辑", self)
+            edit_btn.setFixedWidth(72)
+            edit_btn.clicked.connect(lambda: self.edit_requested.emit(self.preset_id))
+            row.addWidget(edit_btn)
+        layout.addLayout(row)
+
+    def _make_icon_button(self, icon, tooltip, signal):
+        button = TransparentToolButton(icon, self)
+        button.setFixedSize(26, 26)
+        button.setToolTip(tooltip)
+        button.clicked.connect(lambda: signal.emit(self.preset_id))
+        return button
+
+
+class AddPresetCard(QWidget):
+    """虚线空卡：点它新建预设。"""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(PRESET_CARD_WIDTH, PRESET_CARD_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("新建预设")
+
+    @staticmethod
+    def _line_color():
+        return QColor(255, 255, 255, 150) if isDarkTheme() else QColor(0, 0, 0, 130)
+
+    def paintEvent(self, event):
+        # 虚线框和 + 都自己画，省掉一个子控件，也免了主题切换时改样式表
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self._line_color()
+
+        pen = QPen(color, 1.5)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 8, 8)
+
+        painter.setPen(QPen(color, 2.0))
+        center = self.rect().center()
+        arm = 12
+        painter.drawLine(center.x() - arm, center.y(), center.x() + arm, center.y())
+        painter.drawLine(center.x(), center.y() - arm, center.x(), center.y() + arm)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
+class CurrentPresetBanner(QFrame):
+    """顶部悬浮条：只显示「当前使用的预设「X」」，没有按钮。
+
+    它是个**状态指示**而不是一次性的编辑会话控件 —— 改动是自动写回当前预设的，
+    所以没有"保存"要做；要脱离预设就点「无预设」那张卡。
+
+    自己给父窗口装事件过滤器来跟随尺寸 —— 和 OverlayResizeFilter 一个路子，
+    但它只认全屏遮罩（`_loading_overlay`），这里要的是顶部居中的窄条。
+    """
+
+    TOP_OFFSET = 58
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setObjectName("CurrentPresetBanner")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setFixedHeight(44)
+        self._apply_style()
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 6, 18, 6)
+        layout.setSpacing(10)
+        # 两侧都留弹性：图标+文字作为一组居中，比左对齐好看
+        layout.addStretch(1)
+        icon = IconWidget(FIF.SAVE, self)
+        icon.setFixedSize(16, 16)
+        layout.addWidget(icon)
+        self.text_label = BodyLabel("", self)
+        layout.addWidget(self.text_label)
+        layout.addStretch(1)
+
+        self.hide()
+        parent.installEventFilter(self)
+
+    def _apply_style(self):
+        if isDarkTheme():
+            background, border = "rgba(45, 45, 45, 240)", "rgba(255, 255, 255, 45)"
+        else:
+            background, border = "rgba(252, 252, 252, 242)", "rgba(0, 0, 0, 40)"
+        self.setStyleSheet(
+            "#CurrentPresetBanner { background: %s; border: 1px solid %s; border-radius: 10px; }"
+            % (background, border)
+        )
+
+    def set_preset_name(self, name):
+        self.text_label.setText(f"当前使用的预设「{name}」，修改的内容将保存到预设")
+
+    def eventFilter(self, obj, event):
+        if obj is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self._reposition()
+        return False
+
+    def _reposition(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        width = min(560, max(320, parent.width() - 120))
+        self.setGeometry((parent.width() - width) // 2, self.TOP_OFFSET,
+                         width, self.height())
+
+    def show_banner(self):
+        self._reposition()
+        self.show()
+        self.raise_()
+
+
+class FlowContainer(QWidget):
+    """FlowLayout 的宿主。
+
+    Qt 对 heightForWidth 型布局的尺寸计算不会自动传导到滚动区里，容器高度会塌成
+    一行。这里把布局的高度透出去（hasHeightForWidth / heightForWidth），并在每次
+    尺寸变化后按当前宽度回设最小高度。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._flow = FlowLayout(self)
+        self._flow.setContentsMargins(0, 0, 0, 0)
+        self._flow.setHorizontalSpacing(16)
+        self._flow.setVerticalSpacing(16)
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def flow(self):
+        return self._flow
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._flow.heightForWidth(width)
+
+    def refresh_height(self):
+        """卡片增删后重算高度 —— 布局变了但宽度没变，不会触发 resizeEvent。"""
+        self.setMinimumHeight(self._flow.heightForWidth(max(1, self.width())))
+        self._flow.invalidate()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setMinimumHeight(self._flow.heightForWidth(max(1, self.width())))
+
+
+class PresetNameDialog(MessageBoxBase):
+    """预设命名对话框（新建 / 重命名共用）。
+
+    走 MessageBoxBase 而不是 QInputDialog —— 后者是系统原生样式，和 Fluent
+    界面放在一起很突兀。基类已经带来遮罩、阴影、确定/取消按钮和 validate 钩子。
+
+    **必须传 parent**：基类要拿 parent 的尺寸来铺遮罩，传 None 会在库内部
+    报一句很难懂的 AttributeError。
+    """
+
+    def __init__(self, title, value="", parent=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(title, self)
+        self.nameEdit = LineEdit(self)
+        self.nameEdit.setText(value)
+        self.nameEdit.setPlaceholderText("预设名称")
+        self.nameEdit.setClearButtonEnabled(True)
+        self.nameEdit.setMinimumWidth(320)
+
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.nameEdit)
+        self.widget.setMinimumWidth(380)
+
+        self.yesButton.setText("确定")
+        self.cancelButton.setText("取消")
+        self.nameEdit.setFocus()
+
+    def validate(self):
+        """名字为空就不放行 —— 关掉对话框前先挡住。"""
+        return bool(self.nameEdit.text().strip())
+
+    def preset_name(self):
+        return self.nameEdit.text().strip()
+
+
+# ===== 自动任务卡片 =====
+
+AUTO_TASK_CARD_HEIGHT = 76
+
+
+class TimePickerFlyout(FlyoutViewBase):
+    """弹出层里的 24 小时 TimePicker。
+
+    必须走 Flyout 而不是 RoundMenu —— RoundMenu 不会按内容撑开尺寸，实测只显示
+    出一个被裁掉的数字。库里的 TimeEdit 自己也是走 Flyout 的（见 SpinFlyoutView）。
+    """
+
+    def __init__(self, value, parent=None):
+        super().__init__(parent)
+        self.picker = TimePicker(self)
+        self.picker.setTime(value)
+        self.vBoxLayout = QVBoxLayout(self)
+        self.vBoxLayout.setContentsMargins(6, 6, 6, 6)
+        self.vBoxLayout.addWidget(self.picker)
+
+        # TimePicker.sizeHint() 是错的（报 58x16），但让它 show 一次、内部布局就会
+        # 把每列撑到 120。弹出层必须按撑开后的**真实**尺寸定死 —— 否则 Flyout 会
+        # 按 sizeHint 把整个视图收成一个小方块，只露出一个被裁掉的数字。
+        self.picker.show()
+        columns_width = sum(c.width() for c in self.picker.columns if not c.isHidden())
+        margin = self.vBoxLayout.contentsMargins()
+        self.setFixedSize(columns_width + margin.left() + margin.right(),
+                          self.picker.height() + margin.top() + margin.bottom())
+
+    def addWidget(self, widget, stretch=0, align=Qt.AlignmentFlag.AlignLeft):
+        self.vBoxLayout.addWidget(widget, stretch, align)
+
+
+def pick_time(button, current, on_change=None):
+    """在按钮下方弹出 24 小时的 TimePicker，返回选中的 QTime（取消则原值）。
+
+    不用 TimeEdit：那是 QTimeEdit 的 Fluent 皮肤，弹的是自己那套。这里按需求用
+    库里的 TimePicker（源码 docstring 就写着 "24 hours time picker"，小时列
+    range(0, 24)）。
+
+    TimePicker 不显示秒时也有 240px 宽（两列各 120px），平铺进卡片会把整行撑爆，
+    所以按 WinUI 的做法收进弹出层：卡片里只占一个按钮的位置。
+
+    这里用函数而不是子类化 PushButton —— 那个类的 __init__ 是
+    `@__init__.register` 多重分派，分派器内部会调 `self.__init__(parent=parent)`，
+    子类化它就会递归回子类自己的 __init__ 而炸掉。
+    """
+    view = TimePickerFlyout(current, button)
+    flyout = Flyout(view, button, True)          # True = 关闭时自动回收
+    chosen = {"value": current}
+
+    def update(value):
+        chosen["value"] = value
+        if on_change is not None:
+            on_change(value)      # 滚动即回填，所见即所得
+
+    view.picker.timeChanged.connect(update)
+    # Flyout 的 pos 是弹出层的**左上角**（见 _adjustPosition）。放在按钮正下方并
+    # 水平居中对齐：FADE_IN 是往上弹的，这里要用 DROP_DOWN。
+    anchor = button.mapToGlobal(QPoint(0, button.height()))
+    flyout.exec(QPoint(anchor.x() + button.width() // 2 - view.width() // 2,
+                      anchor.y() + 4),
+                FlyoutAnimationType.DROP_DOWN)
+    return chosen["value"]
+
+
+class AutoTaskCard(SimpleCardWidget):
+    """一条自动任务：一行排开「开始时间 / 结束时间 / 套用预设」+ 编辑·保存 / 删除。
+
+    没有独立的任务列表 —— 卡片本身就是列表。
+
+    平时字段只读，第一个按钮是「编辑」；点进编辑态后它变成「保存」，提交当前值。
+    删除始终在。这样两个按钮就够，不用第三个。
+    """
+
+    saved = pyqtSignal(str, dict)      # task_id, {start, end, preset_id}
+    deleted = pyqtSignal(str)
+
+    def __init__(self, task_id, start, end, preset_id, preset_options, parent=None):
+        super().__init__(parent)
+        self.task_id = task_id
+        self._editing = False
+
+        self.setFixedHeight(AUTO_TASK_CARD_HEIGHT)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(20, 10, 20, 10)
+        row.setSpacing(10)
+
+        self._start = start
+        self._end = end
+
+        row.addWidget(BodyLabel("开始时间", self))
+        self.start_button = PushButton(start.toString("HH:mm"), self)
+        self.start_button.setFixedWidth(96)
+        self.start_button.clicked.connect(lambda: self._pick("start"))
+        row.addWidget(self.start_button)
+        row.addSpacing(6)
+        row.addWidget(BodyLabel("结束时间", self))
+        self.end_button = PushButton(end.toString("HH:mm"), self)
+        self.end_button.setFixedWidth(96)
+        self.end_button.clicked.connect(lambda: self._pick("end"))
+        row.addWidget(self.end_button)
+        row.addSpacing(6)
+        row.addWidget(BodyLabel("套用预设", self))
+        self.preset_combo = ComboBox(self)
+        self.preset_combo.setMinimumWidth(180)
+        options = list(preset_options)
+        if preset_id not in [value for _label, value in options]:
+            # 引用的预设被删了：摆一个占位项，让人看得出这条任务需要改
+            options.append(("（预设已不存在）", preset_id))
+        for label, value in options:
+            self.preset_combo.addItem(label, userData=value)
+        index = self.preset_combo.findData(preset_id)
+        if index >= 0:
+            self.preset_combo.setCurrentIndex(index)
+        row.addWidget(self.preset_combo)
+        row.addStretch(1)
+
+        self.action_button = PrimaryPushButton("编辑", self)
+        self.action_button.setFixedWidth(72)
+        self.action_button.clicked.connect(self._on_action)
+        self.delete_button = PushButton("删除", self)
+        self.delete_button.setFixedWidth(72)
+        self.delete_button.clicked.connect(lambda: self.deleted.emit(self.task_id))
+
+        # 横排：卡片是整行宽的，横向空间足够；竖排会把按钮压到最小高度以下、
+        # 文字被裁掉（76px 卡片减去上下边距只剩 56px，两个按钮各分不到 25px）。
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addWidget(self.action_button)
+        buttons.addWidget(self.delete_button)
+        row.addLayout(buttons)
+
+        self.set_editing(False)
+
+    def is_editing(self):
+        return self._editing
+
+    def set_editing(self, editing):
+        """只读态下把三个字段禁掉 —— 免得误改，也让「编辑」有明确职责。"""
+        self._editing = bool(editing)
+        for widget in (self.start_button, self.end_button, self.preset_combo):
+            widget.setEnabled(self._editing)
+        self.action_button.setText("保存" if self._editing else "编辑")
+
+    def set_time(self, which, value):
+        """设定开始 / 结束时间。
+
+        真值存在卡片自己的 QTime 上，按钮文字只是它的显示 —— 所以不能反过来
+        靠 setText 改值（`values()` 也不会去读按钮文字）。
+        """
+        if which == "start":
+            self._start = value
+            self.start_button.setText(value.toString("HH:mm"))
+        else:
+            self._end = value
+            self.end_button.setText(value.toString("HH:mm"))
+
+    def _pick(self, which):
+        if not self._editing:
+            return
+        button = self.start_button if which == "start" else self.end_button
+        current = self._start if which == "start" else self._end
+        chosen = pick_time(button, current,
+                           on_change=lambda value: self.set_time(which, value))
+        self.set_time(which, chosen)
+
+    def values(self):
+        return {
+            "start": self._start.toString("HH:mm"),
+            "end": self._end.toString("HH:mm"),
+            "preset_id": self.preset_combo.currentData(),
+        }
+
+    def _on_action(self):
+        if self._editing:
+            self.saved.emit(self.task_id, self.values())
+        else:
+            self.set_editing(True)
+
+
+class AddTaskCard(QWidget):
+    """整行宽的虚线空卡：点它新增一条任务。"""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(AUTO_TASK_CARD_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("新增自动任务")
+
+    @staticmethod
+    def _line_color():
+        return QColor(255, 255, 255, 150) if isDarkTheme() else QColor(0, 0, 0, 130)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = self._line_color()
+        pen = QPen(color, 1.5)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 8, 8)
+
+        painter.setPen(QPen(color, 2.0))
+        center = self.rect().center()
+        arm = 12
+        painter.drawLine(center.x() - arm, center.y(), center.x() + arm, center.y())
+        painter.drawLine(center.x(), center.y() - arm, center.x(), center.y() + arm)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)

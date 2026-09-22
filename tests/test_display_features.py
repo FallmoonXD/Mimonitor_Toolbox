@@ -315,5 +315,1041 @@ class HotkeyCountdownTests(unittest.TestCase):
         self.assertEqual(stage.call_args.args[2], 55, "50 + 5")
 
 
+class PresetOrchestrationTests(unittest.TestCase):
+    """预设的应用 / 恢复 / 自动任务调度。
+
+    只测编排：真正逐项怎么写的顺序在 test_presets.py 里测。这里关心的是
+    「快照什么时候记、记到哪、还原用谁的快照、未连接时怎么办」。
+    """
+
+    def _host(self, settings, connected=True):
+        from contextlib import nullcontext
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        calls = []
+        logs = []
+
+        class FakeSignal:
+            def __init__(self):
+                self.emitted = []
+
+            def emit(self, *args):
+                self.emitted.append(args)
+
+        class FakeAdb:
+            def __init__(self):
+                self.calls = calls      # 同一个 list，测试里可以直接清空
+
+            def transaction(self):
+                return nullcontext()
+
+            def put(self, key, value, check=False):
+                calls.append(("put", key, value))
+
+            def jni_set(self, key, value, upd=3, check=False):
+                calls.append(("jni_set", key, value, upd))
+
+            def refresh_pq(self, check=False):
+                calls.append(("refresh_pq",))
+
+            def jni_set_color_gains(self, red, green, blue, check=False):
+                calls.append(("gains", red, green, blue))
+
+            def hdr_tone_mapping(self, value, upd=3, check=False):
+                calls.append(("hdr", value))
+
+            def check_and_heal_jar(self):
+                calls.append(("heal",))
+
+        class FakeTimer:
+            def __init__(self):
+                self.start_count = 0
+
+            def start(self):
+                self.start_count += 1
+
+        class Host(DisplayFeaturesMixin):
+            adb = FakeAdb()
+            current_vals = {}
+            adb_connected = connected
+            _preset_sync_timer = FakeTimer()
+            _page_loaded = set()
+            _page_loading = set()
+            _cleanup_done = False
+            _adb_busy_until = 0.0
+            _local_dimming_memory_suppress_until = 0.0
+            _auto_task_checking = False
+            _auto_task_active_id = None
+            _auto_task_waiting_id = None
+            message_signal = FakeSignal()
+            preset_page = object()
+            picture_page = object()
+
+            def __init__(self):
+                self.stack = []
+
+                class FakeStack:
+                    def setCurrentWidget(inner, page):
+                        self.stack.append(page)
+
+                self.stackedWidget = FakeStack()
+                self._preset_banner = mock.Mock()
+
+            def check_connection(self):
+                return connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, message):
+                logs.append(message)
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+            def _read_picture_values(self):
+                return {"picture_mode": 14, "picture_contrast": 50}
+
+            def _refresh_page_data(self, page):
+                calls.append(("refresh", page))
+
+        return Host(), calls, logs
+
+    @staticmethod
+    def _frozen_time(hour, minute):
+        """把 display_features 里的 time 换成假时钟（只看得到 localtime/monotonic/strftime）。"""
+        import time as real_time
+
+        from mimonitor_toolbox import display_features
+
+        fake = mock.MagicMock()
+        fake.localtime.return_value = real_time.struct_time(
+            (2026, 9, 22, hour, minute, 0, 0, 0, 0)
+        )
+        fake.monotonic.return_value = 1000.0
+        fake.strftime.return_value = "2026-09-22 %02d:%02d:00" % (hour, minute)
+        return mock.patch.object(display_features, "time", fake)
+
+    def _patched(self, settings):
+        from mimonitor_toolbox import display_features
+
+        return (
+            mock.patch.object(display_features, "load_settings",
+                              side_effect=lambda: dict(settings)),
+            mock.patch.object(display_features, "update_settings",
+                              side_effect=settings.update),
+            # 应用成功后会排一个延时回读，测试里不需要真的排
+            mock.patch.object(display_features, "QTimer"),
+        )
+
+    def _run(self, settings, connected, fn):
+        load_patch, save_patch, timer_patch = self._patched(settings)
+        with load_patch, save_patch, timer_patch:
+            host, calls, logs = self._host(settings, connected=connected)
+            fn(host)
+            return host, calls, logs
+
+    # ── 手动应用 ──
+
+    def test_applying_a_preset_snapshots_before_writing(self):
+        settings = {"presets": [{"id": "p1", "name": "看电影",
+                                 "values": {"picture_mode": 9, "picture_contrast": 70}}]}
+
+        def run(host):
+            host.apply_preset_by_id("p1")
+
+        _, calls, _ = self._run(settings, True, run)
+
+        # 快照记的是**应用前**读回来的值，不是预设的值
+        self.assertEqual(settings["preset_snapshot"]["values"],
+                         {"picture_mode": 14, "picture_contrast": 50})
+        self.assertEqual(settings["preset_snapshot"]["source"], "看电影")
+        # 写进去的是预设的值
+        self.assertIn(("put", "picture_mode", "9"), calls)
+        self.assertIn(("put", "picture_contrast", "70"), calls)
+
+    def test_applying_an_unknown_preset_does_nothing(self):
+        settings = {"presets": []}
+
+        def run(host):
+            host.apply_preset_by_id("missing")
+
+        _, calls, logs = self._run(settings, True, run)
+        self.assertEqual(calls, [])
+        self.assertNotIn("preset_snapshot", settings)
+        self.assertTrue(any("不存在" in m for m in logs))
+
+    def test_apply_is_refused_when_disconnected(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
+
+        def run(host):
+            host.apply_preset_by_id("p1")
+
+        _, calls, _ = self._run(settings, False, run)
+        self.assertEqual(calls, [])
+        self.assertNotIn("preset_snapshot", settings)
+
+    # ── 恢复 ──
+
+    def test_restore_writes_the_snapshot_back(self):
+        settings = {"preset_snapshot": {"source": "A",
+                                        "values": {"picture_mode": 9, "picture_contrast": 77}}}
+
+        def run(host):
+            host.restore_preset_snapshot()
+
+        _, calls, _ = self._run(settings, True, run)
+        self.assertIn(("put", "picture_mode", "9"), calls)
+        self.assertIn(("put", "picture_contrast", "77"), calls)
+
+    def test_restore_does_not_overwrite_the_snapshot(self):
+        """否则第二次点恢复就还原到「恢复后的状态」，撤销链断掉。"""
+        settings = {"preset_snapshot": {"source": "A", "values": {"picture_mode": 9}}}
+
+        def run(host):
+            host.restore_preset_snapshot()
+
+        self._run(settings, True, run)
+        self.assertEqual(settings["preset_snapshot"]["values"], {"picture_mode": 9})
+        self.assertEqual(settings["preset_snapshot"]["source"], "A")
+
+    def test_restore_without_snapshot_is_a_noop(self):
+        settings = {}
+
+        def run(host):
+            host.restore_preset_snapshot()
+
+        _, calls, logs = self._run(settings, True, run)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("还没有可退回" in m for m in logs))
+
+    def test_has_preset_snapshot_reflects_storage(self):
+        from mimonitor_toolbox import display_features
+
+        empty = {"preset_snapshot": None}
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(empty)):
+            host, _, _ = self._host(empty)
+            self.assertFalse(host.has_preset_snapshot())
+
+        filled = {"preset_snapshot": {"values": {"picture_mode": 9}}}
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(filled)):
+            host, _, _ = self._host(filled)
+            self.assertTrue(host.has_preset_snapshot())
+
+    # ── 自动任务调度 ──
+
+    def _task_settings(self, snapshot=None):
+        return {
+            "presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}],
+            "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                            "preset_id": "p1", "snapshot": snapshot}],
+        }
+
+    def test_task_starts_inside_its_period(self):
+        settings = self._task_settings()
+
+        def run(host):
+            with self._frozen_time(9, 0):
+                host._auto_task_tick()
+
+        host, calls, _ = self._run(settings, True, run)
+        self.assertEqual(host._auto_task_active_id, "t1")
+        self.assertIn(("put", "picture_mode", "9"), calls)
+        # 快照存进任务自身，供时段结束时还原
+        self.assertEqual(settings["auto_tasks"][0]["snapshot"]["values"],
+                         {"picture_mode": 14, "picture_contrast": 50})
+
+    def test_task_does_not_start_outside_its_period(self):
+        settings = self._task_settings()
+
+        def run(host):
+            with self._frozen_time(14, 0):
+                host._auto_task_tick()
+
+        host, calls, _ = self._run(settings, True, run)
+        self.assertIsNone(host._auto_task_active_id)
+        self.assertEqual(calls, [])
+
+    def test_task_waits_when_disconnected_and_writes_nothing(self):
+        settings = self._task_settings()
+
+        def run(host):
+            with self._frozen_time(9, 0):
+                host._auto_task_tick()
+
+        host, calls, logs = self._run(settings, False, run)
+        self.assertIsNone(host._auto_task_active_id)
+        self.assertEqual(host._auto_task_waiting_id, "t1")
+        self.assertEqual(calls, [])
+        self.assertTrue(any("未连接" in m for m in logs))
+
+    def test_period_end_restores_the_tasks_own_snapshot(self):
+        """还原用任务自己的快照，且不碰「手动应用预设」的撤销槽。"""
+        settings = self._task_settings(snapshot={"values": {"picture_mode": 10,
+                                                            "picture_contrast": 44}})
+        settings["preset_snapshot"] = {"source": "手动", "values": {"picture_mode": 14}}
+
+        def run(host):
+            host._auto_task_active_id = "t1"      # 假装时段内已经生效过
+            with self._frozen_time(14, 0):        # 现在已出时段
+                host._auto_task_tick()
+
+        host, calls, logs = self._run(settings, True, run)
+        self.assertIn(("put", "picture_mode", "10"), calls)
+        self.assertIn(("put", "picture_contrast", "44"), calls)
+        self.assertIsNone(host._auto_task_active_id)
+        # 任务快照用掉即清空；手动撤销槽纹丝不动
+        self.assertIsNone(settings["auto_tasks"][0]["snapshot"])
+        self.assertEqual(settings["preset_snapshot"]["values"], {"picture_mode": 14})
+
+    def test_period_end_without_snapshot_only_logs(self):
+        settings = self._task_settings(snapshot=None)
+
+        def run(host):
+            host._auto_task_active_id = "t1"
+            with self._frozen_time(14, 0):
+                host._auto_task_tick()
+
+        _, calls, logs = self._run(settings, True, run)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("没有记录到可还原的快照" in m for m in logs))
+
+    def test_repeated_ticks_do_not_rewrite_an_active_task(self):
+        """同一时段内反复 tick 不该重复下发。"""
+        settings = self._task_settings()
+
+        def run(host):
+            with self._frozen_time(9, 0):
+                for _ in range(3):
+                    host._auto_task_tick()
+
+        _, calls, _ = self._run(settings, True, run)
+        self.assertEqual(len([c for c in calls if c == ("put", "picture_mode", "9")]), 1)
+
+    def test_missing_preset_is_logged_not_crashed(self):
+        settings = {"presets": [],
+                    "auto_tasks": [{"id": "t1", "start": "08:00", "end": "10:00",
+                                    "preset_id": "gone", "snapshot": None}]}
+
+        def run(host):
+            with self._frozen_time(9, 0):
+                host._auto_task_tick()
+
+        host, calls, logs = self._run(settings, True, run)
+        self.assertEqual(calls, [])
+        self.assertTrue(any("已不存在" in m for m in logs))
+
+    # ── 编辑 / 新建（无会话，切过去就是当前预设）──
+
+    def test_edit_applies_the_preset_then_jumps_to_the_picture_page(self):
+        settings = {"presets": [{"id": "p1", "name": "看电影",
+                                 "values": {"picture_mode": 9, "picture_contrast": 70}}]}
+
+        def run(host):
+            host.begin_preset_edit(preset_id="p1")
+
+        host, calls, _ = self._run(settings, True, run)
+        self.assertIn(("put", "picture_mode", "9"), calls)
+        self.assertIn(("put", "picture_contrast", "70"), calls)
+        self.assertEqual(settings["active_preset_id"], "p1")
+        self.assertEqual(host.stack, [host.picture_page])
+
+    def test_edit_on_already_active_preset_only_jumps(self):
+        """已经是当前预设时不该再写一遍设备。"""
+        settings = {"active_preset_id": "p1",
+                    "presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
+
+        def run(host):
+            host.begin_preset_edit(preset_id="p1")
+
+        host, calls, _ = self._run(settings, True, run)
+        self.assertEqual(calls, [])
+        self.assertEqual(host.stack, [host.picture_page])
+
+    def test_edit_is_refused_when_disconnected(self):
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
+
+        def run(host):
+            host.begin_preset_edit(preset_id="p1")
+
+        host, calls, _ = self._run(settings, False, run)
+        self.assertEqual(calls, [])
+        self.assertEqual(host.stack, [])
+
+    def test_create_preset_saves_current_values_and_activates_it(self):
+        settings = {"presets": []}
+
+        def run(host):
+            host.create_preset_from_current("我的预设")
+
+        self._run(settings, True, run)
+        presets = settings["presets"]
+        self.assertEqual(len(presets), 1)
+        self.assertEqual(presets[0]["name"], "我的预设")
+        self.assertEqual(presets[0]["values"], {"picture_mode": 14, "picture_contrast": 50})
+        self.assertEqual(settings["active_preset_id"], presets[0]["id"])
+
+    def test_create_preset_jumps_to_the_picture_page(self):
+        settings = {"presets": []}
+
+        def run(host):
+            host.create_preset_from_current("新的")
+
+        host, _, _ = self._run(settings, True, run)
+        self.assertEqual(host.stack, [host.picture_page])
+
+    def test_create_preset_keeps_duplicate_names_apart(self):
+        settings = {"presets": [{"id": "p1", "name": "重名", "values": {}}]}
+
+        def run(host):
+            host.create_preset_from_current("重名")
+
+        self._run(settings, True, run)
+        self.assertEqual(settings["presets"][1]["name"], "重名 (2)")
+
+    def test_create_preset_is_refused_when_disconnected(self):
+        settings = {"presets": []}
+
+        def run(host):
+            host.create_preset_from_current("新的")
+
+        self._run(settings, False, run)
+        self.assertEqual(settings.get("presets", []), [])
+        self.assertNotIn("active_preset_id", settings)
+
+
+
+
+class ActivePresetAutoSaveTests(unittest.TestCase):
+    """当前预设：改动自动写回、无预设时不动任何预设。"""
+
+    def _host(self, settings, connected=True):
+        from contextlib import nullcontext
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        writes = []
+        logs = []
+
+        class FakeTimer:
+            def __init__(self):
+                self.start_count = 0
+
+            def start(self):
+                self.start_count += 1
+
+        class FakeAdb:
+            def transaction(self):
+                return nullcontext()
+
+            def put(self, key, value, check=False):
+                writes.append(("put", key, value))
+
+            def jni_set(self, key, value, upd=3, check=False):
+                writes.append(("jni_set", key, value))
+
+            def refresh_pq(self, check=False):
+                pass
+
+            def jni_set_color_gains(self, red, green, blue, check=False):
+                pass
+
+            def hdr_tone_mapping(self, value, upd=3, check=False):
+                pass
+
+            def check_and_heal_jar(self):
+                pass
+
+        class Host(DisplayFeaturesMixin):
+            adb = FakeAdb()
+            current_vals = {}
+            adb_connected = connected
+            _page_loaded = set()
+            _page_loading = set()
+            _cleanup_done = False
+            _adb_busy_until = 0.0
+            _preset_sync_timer = FakeTimer()
+
+            def check_connection(self):
+                return connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, message):
+                logs.append(message)
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+            def _read_picture_values(self):
+                return {"picture_mode": 14, "picture_contrast": 88}
+
+        return Host(), writes, logs
+
+    def _patched(self, settings):
+        from mimonitor_toolbox import display_features
+
+        return (
+            mock.patch.object(display_features, "load_settings",
+                              side_effect=lambda: dict(settings)),
+            mock.patch.object(display_features, "update_settings",
+                              side_effect=settings.update),
+            mock.patch.object(display_features, "QTimer"),
+        )
+
+    def test_change_schedules_a_sync_when_a_preset_is_active(self):
+        settings = {"active_preset_id": "p1",
+                    "presets": [{"id": "p1", "name": "A", "values": {}}]}
+        load, save, timer = self._patched(settings)
+        with load, save, timer:
+            host, _, _ = self._host(settings)
+            host._note_picture_change()
+            self.assertEqual(host._preset_sync_timer.start_count, 1)
+
+    def test_change_does_nothing_under_baseline(self):
+        """无预设时改动就是改动本身，没有地方要存。"""
+        settings = {"active_preset_id": None,
+                    "presets": [{"id": "p1", "name": "A", "values": {}}]}
+        load, save, timer = self._patched(settings)
+        with load, save, timer:
+            host, _, _ = self._host(settings)
+            host._note_picture_change()
+            self.assertEqual(host._preset_sync_timer.start_count, 0)
+
+    def test_sync_writes_device_values_into_the_active_preset(self):
+        settings = {"active_preset_id": "p1",
+                    "presets": [
+                        {"id": "p1", "name": "测试预设", "values": {"picture_mode": 9}},
+                        {"id": "p2", "name": "别的", "values": {"picture_mode": 10}},
+                    ]}
+        load, save, timer = self._patched(settings)
+        with load, save, timer:
+            host, _, logs = self._host(settings)
+            host._sync_active_preset()
+
+        self.assertEqual(settings["presets"][0]["values"],
+                         {"picture_mode": 14, "picture_contrast": 88})
+        # 其他预设不受影响
+        self.assertEqual(settings["presets"][1]["values"], {"picture_mode": 10})
+        self.assertTrue(any("测试预设" in m for m in logs))
+
+    def test_sync_is_skipped_when_disconnected(self):
+        settings = {"active_preset_id": "p1",
+                    "presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}}]}
+        load, save, timer = self._patched(settings)
+        with load, save, timer:
+            host, _, _ = self._host(settings, connected=False)
+            host._sync_active_preset()
+        self.assertEqual(settings["presets"][0]["values"], {"picture_mode": 9})
+
+    def test_sync_without_change_does_not_write(self):
+        settings = {"active_preset_id": "p1",
+                    "presets": [{"id": "p1", "name": "A",
+                                 "values": {"picture_mode": 14, "picture_contrast": 88}}]}
+        load, save, timer = self._patched(settings)
+        before = dict(settings)
+        with load, save, timer:
+            host, _, _ = self._host(settings)
+            host._sync_active_preset()
+        self.assertEqual(settings, before)
+
+
+class ActivePresetTransitionTests(unittest.TestCase):
+    """切换当前预设时的状态与快照语义。"""
+
+    def _run(self, settings, fn, connected=True):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        logs = []
+
+        class Host(DisplayFeaturesMixin):
+            adb = mock.Mock()
+            current_vals = {}
+            adb_connected = connected
+            _page_loaded = set()
+
+            def check_connection(self):
+                return connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, message):
+                logs.append(message)
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+            def _apply_picture_values(self, values, label, before_apply=None,
+                                      on_finished=None, quiet=False):
+                self.applied = getattr(self, "applied", [])
+                self.applied.append((label, dict(values)))
+                if before_apply:
+                    before_apply({"picture_mode": 14, "picture_contrast": 50})
+                if on_finished:
+                    on_finished(object())      # 非 None = 成功
+
+            def _read_picture_values(self):
+                return {"picture_mode": 14, "picture_contrast": 50}
+
+            def _refresh_preset_views(self):
+                pass
+
+            preset_page = object()
+            picture_page = object()
+
+            def __init__(self):
+                self.stack = []
+
+                class FakeStack:
+                    def setCurrentWidget(inner, page):
+                        self.stack.append(page)
+
+                class FakeBanner:
+                    def __init__(inner):
+                        inner.visible = False
+                        inner.name = None
+
+                    def set_preset_name(inner, name):
+                        inner.name = name
+
+                    def show_banner(inner):
+                        inner.visible = True
+
+                    def hide(inner):
+                        inner.visible = False
+
+                self.stackedWidget = FakeStack()
+                self._preset_banner = FakeBanner()
+
+        host = Host()
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(settings)), \
+                mock.patch.object(display_features, "update_settings",
+                                  side_effect=settings.update):
+            fn(host)
+        return host, logs
+
+    def test_applying_a_preset_marks_it_active(self):
+        settings = {"active_preset_id": None,
+                    "presets": [{"id": "p1", "name": "看电影", "values": {"picture_mode": 9}}]}
+
+        def run(host):
+            host.apply_preset_by_id("p1")
+
+        self._run(settings, run)
+        self.assertEqual(settings["active_preset_id"], "p1")
+
+    def test_switching_from_baseline_records_the_baseline_values(self):
+        settings = {"active_preset_id": None,
+                    "presets": [{"id": "p1", "name": "看电影", "values": {"picture_mode": 9}}]}
+
+        def run(host):
+            host.apply_preset_by_id("p1")
+
+        self._run(settings, run)
+        self.assertEqual(settings["preset_snapshot"]["values"],
+                         {"picture_mode": 14, "picture_contrast": 50})
+        self.assertEqual(settings["preset_snapshot"]["source"], "看电影")
+
+    def test_switching_between_presets_keeps_the_baseline_values(self):
+        """预设之间互切不该覆盖「无预设」那份值。"""
+        settings = {"active_preset_id": "p1",
+                    "preset_snapshot": {"source": "更早的", "values": {"picture_mode": 9}},
+                    "presets": [{"id": "p1", "name": "A", "values": {"picture_mode": 9}},
+                                {"id": "p2", "name": "B", "values": {"picture_mode": 10}}]}
+
+        def run(host):
+            host.apply_preset_by_id("p2")
+
+        self._run(settings, run)
+        self.assertEqual(settings["preset_snapshot"]["source"], "更早的")
+        self.assertEqual(settings["active_preset_id"], "p2")
+
+    def test_going_back_to_baseline_clears_the_active_preset(self):
+        settings = {"active_preset_id": "p1",
+                    "preset_snapshot": {"source": "A", "values": {"picture_mode": 9}}}
+
+        def run(host):
+            host.restore_preset_snapshot()
+
+        self._run(settings, run)
+        self.assertIsNone(settings["active_preset_id"])
+
+    def test_baseline_card_is_active_by_default(self):
+        settings = {"active_preset_id": None}
+        host, _ = self._run(settings, lambda host: None)
+        self.assertIsNone(host.active_preset_id())
+
+    def test_finishing_an_edit_returns_to_the_preset_page(self):
+        settings = {"presets": []}
+
+        def run(host):
+            host._goto_preset_page()
+
+        host, _ = self._run(settings, run)
+        self.assertEqual(host.stack, [host.preset_page])
+
+
+class CurrentPresetBannerTests(unittest.TestCase):
+    """顶部指示条只表达状态：有预设在用就显示，无预设就收起。"""
+
+    def _run(self, settings):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class FakeBanner:
+            def __init__(self):
+                self.visible = False
+                self.name = None
+
+            def set_preset_name(self, name):
+                self.name = name
+
+            def show_banner(self):
+                self.visible = True
+
+            def hide(self):
+                self.visible = False
+
+        class Host(DisplayFeaturesMixin):
+            _preset_banner = FakeBanner()
+
+        host = Host()
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(settings)):
+            host._update_preset_banner()
+        return host._preset_banner
+
+    def test_banner_hidden_under_baseline(self):
+        banner = self._run({"active_preset_id": None,
+                            "presets": [{"id": "p1", "name": "A", "values": {}}]})
+        self.assertFalse(banner.visible)
+
+    def test_banner_shows_the_active_preset_name(self):
+        settings = {"active_preset_id": "p1",
+                    "presets": [{"id": "p1", "name": "看电影", "values": {}}]}
+        banner = self._run(settings)
+        self.assertTrue(banner.visible)
+        self.assertEqual(banner.name, "看电影")
+
+    def test_banner_hidden_when_active_preset_is_gone(self):
+        """预设被删掉后不该还挂着名字。"""
+        settings = {"active_preset_id": "gone", "presets": []}
+        banner = self._run(settings)
+        self.assertFalse(banner.visible)
+
+    def test_banner_has_no_buttons(self):
+        """指示条不是编辑会话控件 —— 没有保存/取消。"""
+        from mimonitor_toolbox.widgets import CurrentPresetBanner
+
+        self.assertEqual(CurrentPresetBanner.__init__.__code__.co_argcount, 2)  # self, parent
+        self.assertFalse(hasattr(CurrentPresetBanner, "save_requested"))
+        self.assertFalse(hasattr(CurrentPresetBanner, "cancel_requested"))
+
+
+class PresetSwitchingOverlayTests(unittest.TestCase):
+    """切换预设时的全窗口遮罩；窗口在后台时改用悬浮窗提示。"""
+
+    def _host(self, visible=True, minimized=False, connected=True, succeed=True):
+        from contextlib import nullcontext
+
+        from PyQt6.QtWidgets import QWidget
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class FakeAdb:
+            """应用流程会 `with self.adb.transaction()`，所以 transaction 得是个
+            上下文管理器 —— 光用 mock.Mock() 会在 with 那一行炸掉。"""
+
+            def __init__(self):
+                self.calls = []
+
+            def transaction(self):
+                return nullcontext()
+
+            def __getattr__(self, name):
+                def record(*args, **kwargs):
+                    self.calls.append((name,) + args)
+                return record
+
+        class Host(DisplayFeaturesMixin, QWidget):
+            def __init__(self):
+                super().__init__()
+                self.current_vals = {}
+                self.adb_connected = connected
+                self.adb = FakeAdb()
+                self._page_loaded = set()
+                self._adb_busy_until = 0.0
+                self._local_dimming_memory_suppress_until = 0.0
+                self.osd = mock.Mock()
+                self._visible = visible
+                self._minimized = minimized
+                self._succeed = succeed
+
+            def check_connection(self):
+                return connected
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def log(self, message):
+                pass
+
+            def isVisible(self):
+                return self._visible
+
+            def isMinimized(self):
+                return self._minimized
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if self._succeed:
+                    if on_success:
+                        on_success()
+                elif on_failure:
+                    on_failure("故意失败")
+
+            def _read_picture_values(self):
+                return {"picture_mode": 14}
+
+        return Host()
+
+    @staticmethod
+    def _visible_overlays(host):
+        from PyQt6.QtWidgets import QWidget
+
+        return [c for c in host.findChildren(QWidget, "_preset_overlay")
+                if not c.isHidden()]
+
+    def test_foreground_window_gets_the_overlay_not_the_hud(self):
+        host = self._host(visible=True)
+        host._show_preset_switching_overlay()
+        self.assertEqual(len(self._visible_overlays(host)), 1)
+        host.osd.show_hud.assert_not_called()
+
+    def test_hidden_window_uses_the_hud_instead(self):
+        """收进托盘时遮罩看不见，也没有挡住操作的意义。"""
+        host = self._host(visible=False)
+        host._show_preset_switching_overlay()
+        self.assertEqual(self._visible_overlays(host), [])
+        host.osd.show_hud.assert_called_once()
+
+    def test_minimized_window_uses_the_hud(self):
+        host = self._host(visible=True, minimized=True)
+        host._show_preset_switching_overlay()
+        self.assertEqual(self._visible_overlays(host), [])
+        host.osd.show_hud.assert_called_once()
+
+    def test_repeated_show_leaves_only_one_visible_overlay(self):
+        host = self._host()
+        host._show_preset_switching_overlay()
+        host._show_preset_switching_overlay()
+        self.assertEqual(len(self._visible_overlays(host)), 1)
+
+    def test_hide_clears_the_overlay(self):
+        host = self._host()
+        host._show_preset_switching_overlay()
+        host._hide_preset_switching_overlay()
+        self.assertEqual(self._visible_overlays(host), [])
+
+    def test_applying_a_preset_shows_then_clears_the_overlay(self):
+        from mimonitor_toolbox import display_features
+
+        host = self._host()
+        with mock.patch.object(display_features, "QTimer"):
+            host._apply_picture_values({"picture_mode": 9}, "应用预设")
+        self.assertEqual(self._visible_overlays(host), [],
+                         "应用结束后遮罩必须收掉，否则会把整个界面挡住")
+
+    def test_overlay_is_cleared_even_when_the_apply_fails(self):
+        from mimonitor_toolbox import display_features
+
+        host = self._host(succeed=False)
+        with mock.patch.object(display_features, "QTimer"):
+            host._apply_picture_values({"picture_mode": 9}, "应用预设")
+        self.assertEqual(self._visible_overlays(host), [],
+                         "失败路径同样要收遮罩")
+
+    def test_overlay_lives_on_the_window_not_a_page(self):
+        """挂在主窗口上，切预设时不管停在哪一页都挡得住。"""
+        host = self._host()
+        host._show_preset_switching_overlay()
+        overlay = self._visible_overlays(host)[0]
+        self.assertIs(overlay.parentWidget(), host)
+
+
+class MemorySuspensionUnderPresetTests(unittest.TestCase):
+    """有预设生效时两个「记忆」暂停。
+
+    预设和记忆管的是同一件事（为另一种状态备好一套值）。同时生效会打架：
+    HDR 记忆会去写精密控光盖掉预设，而那个写入不会被预设吸收，结果是
+    设备值、画面页值、预设值三方不一致。
+    """
+
+    def _host(self, active_id):
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class Host(DisplayFeaturesMixin):
+            def __init__(self):
+                self.current_vals = {}
+                self.saved = []
+                self.applied = []
+
+            def _hdr_memory_enabled(self):
+                return True
+
+            def log(self, message):
+                pass
+
+            def _save_local_dimming_memory(self, memory):
+                self.saved.append(dict(memory))
+
+            def _get_local_dimming_memory(self):
+                return {"sdr": 3, "hdr": 3}
+
+            def _set_local_dimming_for_memory(self, value, message):
+                self.applied.append(value)
+
+            def _hdr_memory_enabled_flag(self):
+                return True
+
+            def _local_dimming_memory_bucket(self):
+                return "sdr"
+
+        return Host()
+
+    def _run(self, active_id, fn):
+        from mimonitor_toolbox import display_features
+
+        settings = {"active_preset_id": active_id}
+        host = self._host(active_id)
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(settings)):
+            fn(host)
+        return host
+
+    def test_flag_follows_the_active_preset(self):
+        # 断言要在 patch 作用域内求值，否则读的是真实配置
+        flags = []
+        self._run("p1", lambda h: flags.append(h.memories_suspended_by_preset()))
+        self._run(None, lambda h: flags.append(h.memories_suspended_by_preset()))
+        self.assertEqual(flags, [True, False])
+
+    def test_local_dimming_is_not_remembered_under_a_preset(self):
+        """否则预设的值会被记忆当成"用户偏好"收走，停用预设后又被还原回来。"""
+        def record(host):
+            host._remember_local_dimming_value(2)
+
+        host = self._run("p1", record)
+        self.assertEqual(host.saved, [], "预设生效时不该写记忆桶")
+
+        host = self._run(None, record)
+        self.assertTrue(host.saved, "无预设时照旧记录")
+
+    def test_hdr_memory_does_not_write_under_a_preset(self):
+        def apply(host):
+            host._apply_hdr_memory_for_current_state()
+
+        host = self._run("p1", apply)
+        self.assertEqual(host.applied, [], "预设生效时不该去写精密控光")
+
+    def test_freesync_memory_is_bypassed_under_a_preset(self):
+        """FreeSync 记忆和预设都管 FreeSync + 画面模式，规则还不一样。"""
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        settings = {"active_preset_id": "p1", "freesync_mode_memory_enabled": True}
+        remembered = []
+
+        class FakeAdb:
+            def transaction(self):
+                from contextlib import nullcontext
+                return nullcontext()
+
+            def jni_set(self, *args, **kwargs):
+                pass
+
+            def put(self, *args, **kwargs):
+                pass
+
+            def refresh_pq(self, *args, **kwargs):
+                pass
+
+        class Host(DisplayFeaturesMixin):
+            current_vals = {"freesync": 0, "picture_mode": 9}
+            adb_connected = True
+            adb = FakeAdb()
+            state_buttons = {}
+
+            def _refresh_pages(self, pages, delay_ms=0, force=False):
+                pass
+
+            def _freesync_mode_memory_enabled(self):
+                return True
+
+            def memories_suspended_by_preset(self):
+                return True
+
+            def _remember_freesync_previous_mode(self):
+                remembered.append(True)
+
+            def _get_freesync_memory_mode(self):
+                return 9
+
+            def check_connection(self):
+                return True
+
+            def _mark_adb_busy(self, seconds=2.0):
+                pass
+
+            def _take_control_previous(self, key):
+                return None
+
+            def log(self, message):
+                pass
+
+            def _run_adb_action(self, label, operation, on_success=None, on_failure=None):
+                operation()
+                if on_success:
+                    on_success()
+
+            def _note_picture_change(self):
+                pass
+
+            def _get_input_source(self, check=False):
+                return "23"
+
+        host = Host()
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(settings)):
+            host._fsync(True)
+        self.assertEqual(remembered, [], "预设生效时不该记忆 FreeSync 前的模式")
+
+
+class FreeSyncAutoSaveTests(unittest.TestCase):
+    """FreeSync 已在预设范围内，手动开关要写回当前预设。"""
+
+    def test_freesync_toggle_notes_a_picture_change(self):
+        import inspect
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        source = inspect.getsource(DisplayFeaturesMixin._fsync)
+        self.assertIn("_note_picture_change()", source,
+                      "FreeSync 进了预设范围，手动开关必须触发自动保存")
+
+
 if __name__ == "__main__":
     unittest.main()

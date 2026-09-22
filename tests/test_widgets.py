@@ -429,3 +429,157 @@ class OsdHudTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FlowContainerTests(unittest.TestCase):
+    """预设卡片网格的容器：换行与高度透传。
+
+    高度透传是关键 —— Qt 不会自动把 heightForWidth 型布局的高度传给滚动区，
+    漏了容器就塌成一行。
+    """
+
+    def test_height_for_width_matches_wrapping(self):
+        from mimonitor_toolbox.widgets import (
+            PRESET_CARD_HEIGHT,
+            PRESET_CARD_WIDTH,
+            AddPresetCard,
+            FlowContainer,
+            PresetCard,
+        )
+
+        host = FlowContainer()
+        for index in range(6):
+            host.flow().addWidget(PresetCard(f"p{index}", f"预设{index}", "", host))
+        host.flow().addWidget(AddPresetCard(host))
+
+        spacing = 16
+        for width in (600, 900, 1200):
+            with self.subTest(width=width):
+                per_row = max(1, (width + spacing) // (PRESET_CARD_WIDTH + spacing))
+                rows = -(-7 // per_row)          # 7 张卡片
+                expected = rows * PRESET_CARD_HEIGHT + (rows - 1) * spacing
+                self.assertEqual(host.flow().heightForWidth(width), expected)
+                self.assertEqual(host.heightForWidth(width), expected)
+
+    def test_container_advertises_height_for_width(self):
+        from mimonitor_toolbox.widgets import FlowContainer
+
+        host = FlowContainer()
+        self.assertTrue(host.hasHeightForWidth())
+        self.assertTrue(host.sizePolicy().hasHeightForWidth())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TimePickerFlyoutTests(unittest.TestCase):
+    """时间弹出层的尺寸。
+
+    坑：`TimePicker.sizeHint()` 是**错的**（报 58x16，实际 240x30）。弹出层要是
+    照 sizeHint 定尺寸，Flyout 就会收成一个小方块、只露出一个被裁掉的数字
+    （实测就是这样）。
+    """
+
+    def _view(self):
+        from PyQt6.QtCore import QTime
+
+        from mimonitor_toolbox.widgets import TimePickerFlyout
+
+        return TimePickerFlyout(QTime(21, 30))
+
+    def test_view_is_sized_to_the_real_picker_width(self):
+        view = self._view()
+        self.addCleanup(view.deleteLater)
+        # 不显示秒时是「时/分」两列，每列 120
+        self.assertEqual(view.picker.width(), 240)
+        self.assertGreater(view.width(), view.picker.width(),
+                           "外面那圈留白不能吃掉 TimePicker 的宽度")
+
+    def test_view_does_not_trust_the_broken_size_hint(self):
+        view = self._view()
+        self.addCleanup(view.deleteLater)
+        self.assertGreater(view.picker.sizeHint().width(), 0)
+        self.assertGreater(view.width(), view.picker.sizeHint().width() * 3,
+                           "按 sizeHint 定尺寸就会收成一个小方块")
+
+    def test_picker_carries_the_given_time(self):
+        from PyQt6.QtCore import QTime
+
+        from mimonitor_toolbox.widgets import TimePickerFlyout
+
+        view = TimePickerFlyout(QTime(7, 5))
+        self.addCleanup(view.deleteLater)
+        self.assertEqual(view.picker.getTime().toString("HH:mm"), "07:05")
+
+    def test_picker_is_24_hour(self):
+        """必须是 24 小时制。
+
+        用 23:59 往返来验 —— 12 小时制根本表示不了 23 点，这种断言比检查类名
+        更能反映"用户到底能不能选到深夜"。
+        """
+        from PyQt6.QtCore import QTime
+
+        from mimonitor_toolbox.widgets import TimePickerFlyout
+
+        view = TimePickerFlyout(QTime(23, 59))
+        self.addCleanup(view.deleteLater)
+        self.assertEqual(view.picker.getTime().toString("HH:mm"), "23:59")
+
+    def test_picker_is_the_24_hour_class_not_the_am_pm_one(self):
+        from qfluentwidgets import AMTimePicker, TimePicker
+
+        view = self._view()
+        self.addCleanup(view.deleteLater)
+        self.assertIsInstance(view.picker, TimePicker)
+        self.assertNotIsInstance(view.picker, AMTimePicker)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class CurrentPresetBannerTests(unittest.TestCase):
+    """顶部指示条：内容是「当前使用的预设」+ 自动保存说明，且居中。"""
+
+    def _banner(self):
+        from PyQt6.QtWidgets import QWidget
+
+        from mimonitor_toolbox.widgets import CurrentPresetBanner
+
+        host = QWidget()
+        host.resize(900, 600)
+        self.addCleanup(host.deleteLater)
+        banner = CurrentPresetBanner(host)
+        self.addCleanup(banner.deleteLater)
+        return banner
+
+    def test_text_names_the_preset(self):
+        banner = self._banner()
+        banner.set_preset_name("测试")
+        self.assertIn("测试", banner.text_label.text())
+        self.assertIn("当前使用的预设", banner.text_label.text())
+
+    def test_text_mentions_where_changes_go(self):
+        """画面页那行提示撤掉后，这句必须留在这里 —— 否则用户不知道改动去哪了。"""
+        banner = self._banner()
+        banner.set_preset_name("测试")
+        self.assertIn("保存到预设", banner.text_label.text())
+
+    def test_text_stays_short(self):
+        """指示条是一行窄条，太长会被截断。"""
+        banner = self._banner()
+        banner.set_preset_name("测试")
+        self.assertLessEqual(len(banner.text_label.text()), 30)
+
+    def test_text_is_centered_by_stretches_on_both_sides(self):
+        banner = self._banner()
+        layout = banner.layout()
+        self.assertIsNotNone(layout.itemAt(0).spacerItem(),
+                             "左侧要有弹性项才会居中")
+        self.assertIsNotNone(layout.itemAt(layout.count() - 1).spacerItem(),
+                             "右侧要有弹性项才会居中")
+
+
+if __name__ == "__main__":
+    unittest.main()

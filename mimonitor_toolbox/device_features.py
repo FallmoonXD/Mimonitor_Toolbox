@@ -45,11 +45,78 @@ from .network_scan import (
     enumerate_windows_adapter_addresses,
     is_tcp_endpoint_open,
 )
+from .presets import (
+    PICTURE_PRESET_JNI_KEYS,
+    PICTURE_PRESET_SETTINGS_KEYS,
+    freesync_is_on,
+    freesync_jni_key,
+)
 from .widgets import InstallProgressDialog, OverlayResizeFilter
 
 _global_overlay_filter = None
 CREATE_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
 RESUME_DISCOVERY_INTERVAL_SECONDS = 30.0
+
+
+def apply_picture_jni_overrides(settings_vals, jni_batch_vals):
+    """把画面页的 JNI 回读值覆盖到 settings 值上，返回需单独下发的 JNI 键。
+
+    画面页里的多项以 JNI 为准而不是 settings —— settings 会漂移（用户用显示器
+    自带的 OSD 改过、或上一次写入只成功了一半），只信 settings 会让界面显示的
+    值与硬件实际不符。
+
+    背光读数要另外走 jni_values_signal 去驱动滑杆，所以单独返回，其余直接就地
+    覆盖 `settings_vals`。页面刷新与预设快照采集共用本函数，保证两边口径一致。
+    """
+    jni_out = {}
+
+    # 背光：JNI 是真实生效值
+    if "g_disp__disp_back_light" in jni_batch_vals:
+        jni_out["g_disp__disp_back_light"] = jni_batch_vals["g_disp__disp_back_light"]
+
+    # 色域：MTK 值和 settings 值同域，直接覆盖主键和旧 OSD 键
+    if "g_video__vid_gamut_mapping_mode" in jni_batch_vals:
+        try:
+            gamut_val = int(jni_batch_vals["g_video__vid_gamut_mapping_mode"])
+            settings_vals["tv_picture_advanced_video_color_space"] = gamut_val
+            settings_vals["tv_picture_video_color_space"] = gamut_val
+        except (TypeError, ValueError): pass
+
+    # 色温：MTK 枚举需转成小米枚举
+    if "g_video__clr_temp" in jni_batch_vals:
+        try:
+            clr_val = int(jni_batch_vals["g_video__clr_temp"])
+            if clr_val in MTK_TO_XIAOMI_COLOR_TEMP:
+                settings_vals["picture_color_temperature"] = MTK_TO_XIAOMI_COLOR_TEMP[clr_val]
+        except (TypeError, ValueError): pass
+
+    # 精密控光：覆盖官方主键和旧 OSD 键
+    if "g_video__vid_local_dimming" in jni_batch_vals:
+        try:
+            dim_val = int(jni_batch_vals["g_video__vid_local_dimming"])
+            settings_vals["picture_local_dimming"] = dim_val
+            settings_vals["tv_picture_video_local_dimming"] = dim_val
+        except (TypeError, ValueError): pass
+
+    # 光感：菜单读的是 MTK 侧
+    if "g_video__light_sensor_switch" in jni_batch_vals:
+        try:
+            settings_vals["tv_picture_light_sensor"] = int(
+                jni_batch_vals["g_video__light_sensor_switch"]
+            )
+        except (TypeError, ValueError): pass
+
+    # HDR 色调映射：OSD 索引与 MTK 底层枚举不同，两个键存不同枚举
+    if "g_video__vid_hdr_tone_mapping_mode" in jni_batch_vals:
+        try:
+            tone_val = int(jni_batch_vals["g_video__vid_hdr_tone_mapping_mode"])
+            settings_vals["picture_hdr_tone_mapping"] = tone_val
+            ui_val = HDR_TONE_MAPPING_MTK_TO_UI.get(tone_val)
+            if ui_val is not None:
+                settings_vals["settings_display_hdr_color_tone"] = ui_val
+        except (TypeError, ValueError): pass
+
+    return jni_out
 
 
 class DeviceFeaturesMixin:
@@ -1350,6 +1417,46 @@ class DeviceFeaturesMixin:
         if name in self._page_data_keys and name not in self._page_loaded and name not in self._page_loading:
             self._refresh_page_data(name)
 
+    def _read_picture_values(self):
+        """在同一个 ADB 事务里读一份画面页的完整快照，返回生效值。
+
+        与 `_refresh_page_data("picturePage")` 同口径：批量读 settings + 批量读 JNI，
+        再由 `apply_picture_jni_overrides` 让 JNI 值覆盖 settings（JNI 才是硬件真实
+        状态）。预设的「保存当前设置」和应用前的「撤销快照」都用这个。
+
+        调用方负责确认已连接；本函数会在失败时抛异常。
+        """
+        values = {}
+        with self.adb.transaction():
+            keys_str = " ".join(PICTURE_PRESET_SETTINGS_KEYS)
+            out = self.adb.shell(
+                f"for k in {keys_str}; do echo $k=$(settings get global $k); done",
+                check=True,
+            )
+            for line in out.split("\n"):
+                key, sep, raw = line.strip().partition("=")
+                if not sep or not key:
+                    continue
+                if raw in ("", "null", "N/A"):
+                    continue
+                try:
+                    values[key] = int(raw)
+                except (TypeError, ValueError):
+                    values[key] = raw
+
+            jni_vals = self.adb.jni_batch_get_or_single(PICTURE_PRESET_JNI_KEYS, check=True)
+            apply_picture_jni_overrides(values, jni_vals)
+
+            # FreeSync 也纳入预设：它开着会把设备锁在游戏模式，必须能和画面模式
+            # 一起被记录、一起被还原。它没有 settings 键，且走的 MTK 键随输入源
+            # 变（DP/USB-C 与 HDMI 不同），所以单独按输入源读。
+            source = self.adb.get("mitv.tvplayer.hdmi.last.source", check=True)
+            fs_key = freesync_jni_key(source)
+            fs_raw = self.adb.jni_batch_get_or_single([fs_key], check=True).get(fs_key)
+            if fs_raw is not None:
+                values["freesync"] = 1 if freesync_is_on(fs_key, fs_raw) else 0
+        return values
+
     def _refresh_page_data(self, page_name):
         if not getattr(self, "adb_connected", False):
             return
@@ -1393,52 +1500,8 @@ class DeviceFeaturesMixin:
                     if jni_keys:
                         jni_batch_vals = self.adb.jni_batch_get_or_single(jni_keys)
 
-                    # 读取 JNI 背光
-                    if "g_disp__disp_back_light" in jni_batch_vals:
-                        jni_vals["g_disp__disp_back_light"] = jni_batch_vals["g_disp__disp_back_light"]
-
-                    # 读取 JNI 色域 (覆盖 settings 中的主键和旧 OSD 键)
-                    if "g_video__vid_gamut_mapping_mode" in jni_batch_vals:
-                        try:
-                            gamut_val = int(jni_batch_vals["g_video__vid_gamut_mapping_mode"])
-                            # MTK 值和 settings 值一致，直接覆盖
-                            settings_vals["tv_picture_advanced_video_color_space"] = gamut_val
-                            settings_vals["tv_picture_video_color_space"] = gamut_val
-                        except (TypeError, ValueError): pass
-
-                    # 读取 JNI 色温 (MTK 值需转换为小米 settings 枚举值)
-                    if "g_video__clr_temp" in jni_batch_vals:
-                        try:
-                            clr_val = int(jni_batch_vals["g_video__clr_temp"])
-                            if clr_val in MTK_TO_XIAOMI_COLOR_TEMP:
-                                settings_vals["picture_color_temperature"] = MTK_TO_XIAOMI_COLOR_TEMP[clr_val]
-                        except (TypeError, ValueError): pass
-
-                    # 读取 JNI 控光 (覆盖官方主键和旧 OSD 键)
-                    if "g_video__vid_local_dimming" in jni_batch_vals:
-                        try:
-                            dim_val = int(jni_batch_vals["g_video__vid_local_dimming"])
-                            settings_vals["picture_local_dimming"] = dim_val
-                            settings_vals["tv_picture_video_local_dimming"] = dim_val
-                        except (TypeError, ValueError): pass
-
-                    # 读取 JNI 光感开关 (菜单读的是 MTK 侧，覆盖 settings 值)
-                    if "g_video__light_sensor_switch" in jni_batch_vals:
-                        try:
-                            settings_vals["tv_picture_light_sensor"] = int(
-                                jni_batch_vals["g_video__light_sensor_switch"]
-                            )
-                        except (TypeError, ValueError): pass
-
-                    # HDR 色调映射的 OSD 索引与 MTK 底层枚举不同。
-                    if "g_video__vid_hdr_tone_mapping_mode" in jni_batch_vals:
-                        try:
-                            tone_val = int(jni_batch_vals["g_video__vid_hdr_tone_mapping_mode"])
-                            ui_val = HDR_TONE_MAPPING_MTK_TO_UI.get(tone_val)
-                            settings_vals["picture_hdr_tone_mapping"] = tone_val
-                            if ui_val is not None:
-                                settings_vals["settings_display_hdr_color_tone"] = ui_val
-                        except (TypeError, ValueError): pass
+                    # 画面页各项以 JNI 回读为准（口径与预设快照采集一致）
+                    jni_vals.update(apply_picture_jni_overrides(settings_vals, jni_batch_vals))
 
                     # 读取 JNI 模式 (game page)
                     if cfg.get("jni_mode"):

@@ -14,6 +14,7 @@ class ModuleBoundaryTests(unittest.TestCase):
             "network_scan",
             "windows",
             "widgets",
+            "presets",
             "pages",
             "display_features",
             "device_features",
