@@ -207,8 +207,8 @@ struct ToolsView: View {
                     }
                 }
 
-                Link("仓库地址：https://github.com/YiHooong/Mimonitor_Toolbox",
-                     destination: URL(string: "https://github.com/YiHooong/Mimonitor_Toolbox")!)
+                Link("仓库地址：https://github.com/YiHoooong/Mimonitor_Toolbox",
+                     destination: URL(string: "https://github.com/YiHoooong/Mimonitor_Toolbox")!)
                     .font(.callout)
                     .foregroundColor(Color(red: 0.45, green: 0.31, blue: 1.0))
                     .frame(maxWidth: .infinity)

@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
     QFrame,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -62,6 +63,10 @@ from .widgets import TRAY_ROW_HEIGHT, PageScrollSlider, TrayItemList
 
 # 行高常量（TRAY_ROW_HEIGHT）由 widgets.TrayRowDelegate 拥有，这里只定义可见行数上限
 TRAY_VISIBLE_ROWS = 8
+
+# 关掉「快捷键松手后生效」开关时，倒计时时长那一行降到这个透明度
+# （对齐 macOS 版 ToolsView 的 .opacity(0.4)）
+COUNTDOWN_DISABLED_OPACITY = 0.4
 
 
 class PagesMixin:
@@ -882,6 +887,74 @@ class PagesMixin:
         lbl_tip.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
         c3_lay.addWidget(lbl_tip)
 
+        # ── 快捷键松手后生效（倒计时）──
+        # 位置对齐 macOS 版 ToolsView：在「软件设置」段里、其它设置之后用一条
+        # Divider 隔开，然后是开关 + 时长滑杆。
+        # 分隔线。qfluentwidgets 里没有 Divider 控件，用一条 1px 细线代替；
+        # 颜色取中性灰 + 透明度，深浅色主题下都成立，不必按主题分支。
+        countdown_separator = QFrame(card3)
+        countdown_separator.setFixedHeight(1)
+        countdown_separator.setStyleSheet(
+            "background-color: rgba(127, 127, 127, 60); border: none;")
+        c3_lay.addWidget(countdown_separator)
+
+        countdown_row = QHBoxLayout()
+        countdown_row.setSpacing(12)
+        self.chk_hotkey_countdown = CheckBox("快捷键松手后生效（倒计时）", card3)
+        self.chk_hotkey_countdown.setChecked(settings.get("hotkey_countdown_enabled", True))
+        self.chk_hotkey_countdown.stateChanged.connect(self._toggle_hotkey_countdown)
+        countdown_row.addWidget(self.chk_hotkey_countdown)
+        countdown_row.addStretch(1)
+        c3_lay.addLayout(countdown_row)
+
+        # 时长。滑杆是整数控件，用「十分之一秒」当单位（2~30 即 0.2~3.0 秒），
+        # 范围与步长对齐 macOS 版的 0.2...3.0 / step 0.1。
+        self.countdown_seconds_row = QWidget(card3)
+        seconds_layout = QHBoxLayout(self.countdown_seconds_row)
+        seconds_layout.setContentsMargins(0, 0, 0, 0)
+        seconds_layout.setSpacing(12)
+        seconds_layout.addWidget(BodyLabel("倒计时时长", self.countdown_seconds_row))
+
+        self.countdown_seconds_slider = Slider(
+            Qt.Orientation.Horizontal, self.countdown_seconds_row)
+        self.countdown_seconds_slider.setRange(2, 30)
+        self.countdown_seconds_slider.setSingleStep(1)
+        try:
+            _countdown_seconds = float(settings.get("hotkey_countdown_seconds", 0.8))
+        except (TypeError, ValueError):
+            _countdown_seconds = 0.8
+        self.countdown_seconds_slider.setValue(
+            max(2, min(30, round(_countdown_seconds * 10))))
+        seconds_layout.addWidget(self.countdown_seconds_slider)
+
+        self.countdown_seconds_label = BodyLabel("", self.countdown_seconds_row)
+        self.countdown_seconds_label.setFixedWidth(56)
+        self.countdown_seconds_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        seconds_layout.addWidget(self.countdown_seconds_label)
+        c3_lay.addWidget(self.countdown_seconds_row)
+
+        def _sync_countdown_seconds_label(tenths):
+            self.countdown_seconds_label.setText(f"{tenths / 10:.1f} 秒")
+
+        def _commit_countdown_seconds():
+            # 写配置不是写设备：不用查连接、不走 ADB 事务，去抖后直接落盘
+            update_settings({
+                "hotkey_countdown_seconds": self.countdown_seconds_slider.value() / 10.0,
+            })
+
+        self._countdown_seconds_timer = QTimer(card3)
+        self._countdown_seconds_timer.setSingleShot(True)
+        self._countdown_seconds_timer.setInterval(300)
+        self._countdown_seconds_timer.timeout.connect(_commit_countdown_seconds)
+        self.countdown_seconds_slider.valueChanged.connect(_sync_countdown_seconds_label)
+        self.countdown_seconds_slider.valueChanged.connect(
+            lambda _v: self._countdown_seconds_timer.start())
+        _sync_countdown_seconds_label(self.countdown_seconds_slider.value())
+
+        self._sync_countdown_enabled_ui(
+            settings.get("hotkey_countdown_enabled", True))
+
         hdr_memory_layout = QHBoxLayout()
         hdr_memory_layout.setSpacing(15)
         self.chk_hdr_local_dimming_memory = CheckBox("HDR/SDR 分区控光记忆", card3)
@@ -1133,20 +1206,8 @@ class PagesMixin:
         btn_add_adjust_hotkey.clicked.connect(lambda: add_adjust_hotkey_row())
         c4_lay.addWidget(btn_add_adjust_hotkey)
             
-        # 松手后生效（倒计时）：连按时只有最后一次的值落到显示器，
-        # 等待期间悬浮提示会显示倒计时进度条。
-        countdown_row = QHBoxLayout()
-        countdown_row.setSpacing(12)
-        self.chk_hotkey_countdown = CheckBox("快捷键松手后生效（倒计时）", card4)
-        self.chk_hotkey_countdown.setChecked(settings.get("hotkey_countdown_enabled", True))
-        self.chk_hotkey_countdown.stateChanged.connect(self._toggle_hotkey_countdown)
-        countdown_row.addWidget(self.chk_hotkey_countdown)
-        countdown_row.addStretch(1)
-        c4_lay.addLayout(countdown_row)
-        c4_lay.addWidget(CaptionLabel(
-            "* 关闭后每次按键立即下发（更跟手，但连按会把 ADB 命令堆起来）。",
-            card4,
-        ))
+        # 「快捷键松手后生效（倒计时）」的开关与时长滑杆不在这里 —— 它们在
+        # **「软件设置」**卡片里，位置对齐 macOS 版 ToolsView 的同一段。
 
         btn_save_hotkeys = PrimaryPushButton(FIF.TAG, "保存并应用全局快捷键", card4)
         c4_lay.addWidget(btn_save_hotkeys)
@@ -1200,7 +1261,7 @@ class PagesMixin:
         layout.addLayout(grid)
 
         github_link = BodyLabel(container)
-        github_link.setText('仓库地址：<a href="https://github.com/YiHooong/Mimonitor_Toolbox" style="color: #734EFF;">https://github.com/YiHooong/Mimonitor_Toolbox</a>')
+        github_link.setText('仓库地址：<a href="https://github.com/YiHoooong/Mimonitor_Toolbox" style="color: #734EFF;">https://github.com/YiHoooong/Mimonitor_Toolbox</a>')
         github_link.setOpenExternalLinks(True)
         github_link.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1208,6 +1269,26 @@ class PagesMixin:
 
         scroll.setWidget(container)
         return scroll
+
+    def _sync_countdown_enabled_ui(self, enabled):
+        """倒计时开关的联动：时长那一行跟着启用 / 置灰。
+
+        对齐 macOS 版 ``ToolsView`` 的 ``.disabled(...)`` + ``.opacity(0.4)``。
+        这里不配说明文案 —— 开关本身已经说明了状态。
+        """
+        row = getattr(self, "countdown_seconds_row", None)
+        if row is None:
+            return
+        enabled = bool(enabled)
+        row.setEnabled(enabled)
+        # 整行降到 40% 透明（同 TraySliderRow 断连时的做法）
+        if enabled:
+            self._countdown_seconds_dim = None
+            row.setGraphicsEffect(None)
+        else:
+            self._countdown_seconds_dim = QGraphicsOpacityEffect(row)
+            self._countdown_seconds_dim.setOpacity(COUNTDOWN_DISABLED_OPACITY)
+            row.setGraphicsEffect(self._countdown_seconds_dim)
 
     def _make_remote_page(self):
         container = QWidget()

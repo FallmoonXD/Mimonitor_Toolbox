@@ -25,8 +25,12 @@ class TrayTestBase(unittest.TestCase):
     def _app(self):
         from mimonitor_toolbox.main_window import App
 
+        # 除了热键和托盘，还要挡掉启动自动连接：它由 QTimer.singleShot(900)
+        # 排程，测试进程跑得久、processEvents 调得勤，会被翻出来真的去扫内网
+        # 并 adb connect，那些进程会漏进 test_runtime 的进程计数里。
         with mock.patch.object(App, "register_global_hotkeys"), \
-                mock.patch.object(App, "setup_tray"):
+                mock.patch.object(App, "setup_tray"), \
+                mock.patch.object(App, "_auto_connect_on_startup"):
             return App()
 
     def _tray_page_app(self):
@@ -41,6 +45,13 @@ class TrayTestBase(unittest.TestCase):
 
     def _close(self, window):
         window._cleanup_done = True
+        # 停掉周期定时器再销毁。只 deleteLater 的话，这些定时器在对象真正被回收
+        # 之前还会响 —— 实测会漏进 test_runtime 的进程计数里（那边统计整个窗口期
+        # 内的所有 Popen 调用，多出几次就断言失败）。
+        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer"):
+            timer = getattr(window, name, None)
+            if timer is not None:
+                timer.stop()
         window.hide()
         window.deleteLater()
         _qt_application.processEvents()
@@ -227,6 +238,91 @@ class PageContractTests(unittest.TestCase):
         _qt_application.processEvents()
 
 
+class CountdownSettingsUiTests(TrayTestBase):
+    """工具页的「倒计时时长」控件 —— 对齐 macOS 版 ToolsView。
+
+    之前 Windows 侧只有开关、没有改时长的入口，值只能手改 config.json。
+
+    整类共用**一个** App 实例：每个用例各建一次的话，共享 QApplication 的
+   测试进程里生命周期太多，容易踩到 Qt 的回收竞态（实测会让全量跑不稳定）。
+    """
+
+    _window = None
+
+    def setUp(self):
+        if CountdownSettingsUiTests._window is None:
+            CountdownSettingsUiTests._window = self._app()
+        self.window = CountdownSettingsUiTests._window
+        # 每个用例从同一档出发，避免互相影响
+        self.window.countdown_seconds_slider.setValue(8)
+
+    @classmethod
+    def tearDownClass(cls):
+        window = CountdownSettingsUiTests._window
+        CountdownSettingsUiTests._window = None
+        if window is None:
+            return
+        window._cleanup_done = True
+        for name in ("adb_keepalive_timer", "adb_server_monitor_timer", "hdr_memory_timer"):
+            timer = getattr(window, name, None)
+            if timer is not None:
+                timer.stop()
+        window.hide()
+        window.deleteLater()
+        _qt_application.processEvents()
+
+    def test_duration_slider_range_matches_macos(self):
+        slider = self.window.countdown_seconds_slider
+        self.assertEqual(slider.minimum(), 2, "下限 0.2 秒")
+        self.assertEqual(slider.maximum(), 30, "上限 3.0 秒")
+        self.assertEqual(slider.value(), 8, "默认 0.8 秒")
+        self.assertEqual(self.window.countdown_seconds_label.text(), "0.8 秒")
+
+    def test_duration_readout_format(self):
+        self.window.countdown_seconds_slider.setValue(15)
+        self.assertEqual(self.window.countdown_seconds_label.text(), "1.5 秒")
+        self.window.countdown_seconds_slider.setValue(30)
+        self.assertEqual(self.window.countdown_seconds_label.text(), "3.0 秒")
+
+    def test_duration_committed_as_seconds_after_debounce(self):
+        """滑杆是整数控件（十分之一秒），落盘要换算回秒。"""
+        from mimonitor_toolbox import pages as pages_module
+
+        written = {}
+        with mock.patch.object(pages_module, "update_settings",
+                               side_effect=written.update):
+            self.window.countdown_seconds_slider.setValue(24)
+            self.window._countdown_seconds_timer.stop()
+            self.window._countdown_seconds_timer.timeout.emit()
+
+        self.assertAlmostEqual(written.get("hotkey_countdown_seconds"), 2.4)
+
+    def test_duration_controls_disabled_with_countdown_off(self):
+        """关掉倒计时开关时，时长那一行禁用 + 整体降到 40% 透明
+        （对齐 macOS 的 .disabled + .opacity(0.4)）。"""
+        from mimonitor_toolbox.pages import COUNTDOWN_DISABLED_OPACITY
+
+        window = self.window
+        row = window.countdown_seconds_row
+
+        window._sync_countdown_enabled_ui(True)
+        self.assertTrue(row.isEnabled())
+        self.assertIsNone(row.graphicsEffect())
+
+        window._sync_countdown_enabled_ui(False)
+        self.assertFalse(row.isEnabled())
+        self.assertIsNotNone(row.graphicsEffect())
+        self.assertAlmostEqual(row.graphicsEffect().opacity(),
+                               COUNTDOWN_DISABLED_OPACITY)
+        window._sync_countdown_enabled_ui(True)
+
+    def test_duration_floor_above_setting_clamp(self):
+        """设置层把 delay 钳到 ≥0.1（tests/test_display_features.py 锁着）；
+        滑杆下限 0.2 天然满足，这里守住别把它放开。"""
+        self.window.countdown_seconds_slider.setValue(1)
+        self.assertEqual(self.window.countdown_seconds_slider.value(), 2)
+
+
 class TrayMenuTests(TrayTestBase):
     """托盘右键菜单：目录、取值联动、菜单结构与左右键分流。"""
 
@@ -325,7 +421,7 @@ class TrayMenuTests(TrayTestBase):
                          "拖动时数值要实时跟到托盘那一行")
         self._close(window)
 
-    def test_点击数值条目也能展开浮条(self):
+    def test_numeric_entry_expands_card_on_click(self):
         """悬停之外再给一个明确入口：点这一行也把浮条弹出来。
 
         普通条目点击会关掉整条菜单，数值条目不该跟着关 —— 浮条是挂在菜单这个
@@ -363,7 +459,7 @@ class TrayMenuTests(TrayTestBase):
             _qt_application.processEvents()
         self._close(window)
 
-    def test_点击普通条目仍走原路径(self):
+    def test_plain_entry_keeps_default_click_path(self):
         """只有数值条目被接管；状态行这种普通条目要保持库的原有行为。"""
         from mimonitor_toolbox.widgets import TrayMenu
 

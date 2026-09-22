@@ -1219,6 +1219,61 @@ class WindowsResumeReconnectTests(unittest.TestCase):
 
         self.assertNotIn("connect", calls)
 
+    def test_startup_connect_skipped_after_cleanup(self):
+        """回归：``_auto_connect_on_startup`` 由 ``QTimer.singleShot(900)`` 排程，
+        程序退出（或测试里窗口已销毁）之后仍会被事件循环翻出来。那时再去连设备
+        就晚了 —— 会留下一串指向已销毁对象的 adb 进程。
+
+        它一度是唯一没有清理守卫的定时器回调；测试里为了不触发真实扫描把它
+        patch 掉了，于是这条路径没人走，守卫被删也不会红。这两条用例守住它。
+        """
+        for flag in ("_cleanup_done", "_windows_session_ending"):
+            with self.subTest(flag=flag):
+                host = ReconnectHost()
+                host.ip_entry = SimpleNamespace(setText=lambda _value: None)
+                host.auto_scan_signal = FakeSignal()
+                calls = []
+                workers = []
+                host.adb.connect = lambda: calls.append("connect") or True
+                setattr(host, flag, True)
+
+                with mock.patch.object(device_features, "load_settings",
+                                       return_value={"saved_ip": "192.168.5.205"}), \
+                        mock.patch.object(device_features, "async_run",
+                                          side_effect=workers.append):
+                    host._auto_connect_on_startup()
+
+                self.assertEqual(workers, [], "置位后不该再排连接任务")
+                self.assertEqual(calls, [], "置位后不该去连设备")
+
+    def test_startup_scan_skipped_after_cleanup(self):
+        """同一个守卫也要挡住「没有 saved_ip 就去扫内网」那条分支。"""
+        host = ReconnectHost()
+        host.auto_scan_signal = FakeSignal()
+        host._cleanup_done = True
+
+        with mock.patch.object(device_features, "load_settings",
+                               return_value={"saved_ip": ""}):
+            host._auto_connect_on_startup()
+
+        self.assertEqual(host.auto_scan_signal.events, [], "清理后不该触发内网扫描")
+
+    def test_startup_connect_still_runs_when_not_cleaned_up(self):
+        """对照：守卫不能把正常路径一起挡掉。"""
+        host = ReconnectHost()
+        host.ip_entry = SimpleNamespace(setText=lambda _value: None)
+        host.auto_scan_signal = FakeSignal()
+        workers = []
+        host.adb.connect = lambda: True
+
+        with mock.patch.object(device_features, "load_settings",
+                               return_value={"saved_ip": "192.168.5.205"}), \
+                mock.patch.object(device_features, "async_run",
+                                  side_effect=workers.append):
+            host._auto_connect_on_startup()
+
+        self.assertEqual(len(workers), 1, "正常路径应照常排一个连接任务")
+
     def test_adb_action_worker_aborts_when_disconnect_finishes_first(self):
         host = ReconnectHost()
         host.adb_connected = True

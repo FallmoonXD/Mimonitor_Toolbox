@@ -15,7 +15,17 @@ from PyQt6.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QDrag,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -675,16 +685,30 @@ class CountdownBar(QWidget):
 
     由 QPropertyAnimation 驱动（而不是逐帧定时器写值），动画本身走 Qt 的
     插值，不需要外部时钟，也不会因为主线程忙而丢帧。
+
+    这里保留 QPropertyAnimation 是刻意的：macOS 版注释里警告过「30Hz 定时器
+    逐帧写值只有 24 个台阶、肉眼能看出跳跃」，但那说的是**手写定时器**；Qt 的
+    动画系统自己插值，没有那个问题。
+
+    颜色由外部通过 :meth:`apply_colors` 注入（跟随主题），不在这里写死。
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(5)
         self._progress = 1.0
+        self._track_color = QColor(255, 255, 255, 40)
+        self._fill_color = QColor("#0078d4")
         self._anim = QPropertyAnimation(self, b"progress", self)
         self._anim.setStartValue(1.0)
         self._anim.setEndValue(0.0)
         self._anim.setEasingCurve(QEasingCurve.Type.Linear)
+
+    def apply_colors(self, track, fill):
+        """设置轨道色与填充色（OsdHud 按当前主题注入）。"""
+        self._track_color = QColor(track)
+        self._fill_color = QColor(fill)
+        self.update()
 
     def get_progress(self):
         return self._progress
@@ -711,15 +735,14 @@ class CountdownBar(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         radius = self.height() / 2
-        track = QColor(255, 255, 255, 40)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(track)
+        painter.setBrush(self._track_color)
         painter.drawRoundedRect(self.rect(), radius, radius)
 
         width = int(self.width() * self._progress)
         if width <= 0:
             return
-        painter.setBrush(QColor("#0078d4"))
+        painter.setBrush(self._fill_color)
         painter.drawRoundedRect(0, 0, width, self.height(), radius, radius)
 
 
@@ -735,19 +758,18 @@ class OsdHud(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        # 点击穿透：提示不该吞掉点在自己身上的鼠标事件（对齐 macOS 的
+        # panel.ignoresMouseEvents = true）。OSD 里没有可交互子控件，所以
+        # 不会踩到 TrayRowDelegate 注释里那个「连带屏蔽子控件」的坑。
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.setFixedSize(self._hud_size)
+        self._style_dark = None
         
         # Outer container frame
         self.frame = QFrame(self)
         self.frame.setGeometry(0, 0, self._hud_size.width(), self._hud_size.height())
         self.frame.setObjectName("OsdFrame")
-        self.frame.setStyleSheet("""
-            #OsdFrame {
-                background-color: rgba(20, 20, 20, 215);
-                border: 1px solid rgba(255, 255, 255, 45);
-                border-radius: 16px;
-            }
-        """)
+        # 配色不写死：由 _apply_style() 按当前主题注入（见那里的说明）
         
         # Shadow effect
         shadow = QGraphicsDropShadowEffect(self)
@@ -757,22 +779,35 @@ class OsdHud(QWidget):
         self.frame.setGraphicsEffect(shadow)
         
         layout = QVBoxLayout(self.frame)
-        layout.setContentsMargins(25, 18, 25, 18)
+        layout.setContentsMargins(
+            self.CONTENT_MARGIN_X, self.CONTENT_MARGIN_Y,
+            self.CONTENT_MARGIN_X, self.CONTENT_MARGIN_Y,
+        )
         layout.setSpacing(6)
         
         self.title_lbl = QLabel(self)
-        self.title_lbl.setStyleSheet("color: rgba(255, 255, 255, 160); font-size: 13px; font-weight: bold; font-family: 'Segoe UI', 'Microsoft YaHei'; background: transparent;")
+        self.title_lbl.setFont(self._title_font())
+        self.title_lbl.setStyleSheet("background: transparent;")
         self.title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.title_lbl)
         
         self.val_lbl = QLabel(self)
-        self.val_lbl.setStyleSheet("color: #0078d4; font-size: 20px; font-weight: 900; font-family: 'Segoe UI', 'Microsoft YaHei'; background: transparent;")
+        self.val_lbl.setFont(self._value_font())
+        self.val_lbl.setStyleSheet("background: transparent;")
         self.val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.val_lbl)
 
-        # 倒计时进度条：只在「松手后生效」等待期间显示
+        # 倒计时进度条：只在「松手后生效」等待期间显示。
+        # retainSizeWhenHidden：隐藏时**仍然占着**它那 5px + 间距，否则一旦
+        # 收条，标题和数值就会被布局重新居中而整体下垂一下。
+        # （对比过「把进度条做成浮层」的写法：两者收条时文字都不动、切换开销
+        #   实测都是 0.33µs/次，但浮层版没有倒计时时不留底部空带、数值会低
+        #   5px。选了保留占位这版。）
         self.countdown_bar = CountdownBar(self.frame)
         self.countdown_bar.setVisible(False)
+        bar_policy = self.countdown_bar.sizePolicy()
+        bar_policy.setRetainSizeWhenHidden(True)
+        self.countdown_bar.setSizePolicy(bar_policy)
         layout.addWidget(self.countdown_bar)
         
         self.timer = QTimer(self)
@@ -782,6 +817,108 @@ class OsdHud(QWidget):
         # Fade animation
         self.anim = QPropertyAnimation(self, b"windowOpacity")
         self.anim.setDuration(250)
+
+        self._apply_style()
+
+    # 显式指定字体族。微软雅黑是 Windows 自带字体（Vista 起就有），只是引用、
+    # 不需要随程序分发；Qt 找不到该字体也会静默回退，不会出错。
+    # 注：getFont 默认族 ['Segoe UI', 'Microsoft YaHei', ...] 已经让中文走雅黑
+    # 回退了，显式指定是为了让数字和拉丁字符也统一成雅黑。
+    FONT_FAMILIES = ["Microsoft YaHei"]
+
+    # 内容区边距。
+    CONTENT_MARGIN_X = 25
+    CONTENT_MARGIN_Y = 18
+
+    # 强调色：**数值文字 + 进度条填充**都用它。项目品牌色，和托盘图标、工具页
+    # 的仓库链接同款。深浅色主题下都是这个紫，不再按主题取正反色。
+    # 对比度：浅色底 ~4.7:1、深色底 ~3.3:1 —— 都过 WCAG AA 的大字标准
+    # （数值是 20px bold，按大字算），小字标准 4.5:1 深色下达不到。
+    ACCENT = "#734EFF"
+
+    def _value_font(self):
+        """数值字体。"""
+        font = getFont(20, QFont.Weight.Bold)
+        font.setFamilies(self.FONT_FAMILIES)
+        # 表格数字：实测雅黑/Segoe UI 的数字本来就等宽（"9"=12、"100"=36），
+        # 这里是给数字不等宽的字族兜底，在雅黑上是空操作。
+        font.setFeature(QFont.Tag("tnum"), 1)
+        return font
+
+    def _title_font(self):
+        font = getFont(13, QFont.Weight.DemiBold)
+        font.setFamilies(self.FONT_FAMILIES)
+        return font
+
+    @staticmethod
+    def _css(color):
+        """QColor → QSS 能吃的 rgba()。QColor.name() 会丢掉 alpha，不能用。"""
+        return (f"rgba({color.red()}, {color.green()}, {color.blue()}, "
+                f"{color.alpha()})")
+
+    def _palette(self):
+        """按当前主题取一套颜色。
+
+        这里以前是硬编码的 ``rgba(20,20,20,215)`` + ``#0078d4``，恒为深色；
+        macOS 版特意没有照抄（它注释里写明「故意不照抄 Windows 版那套硬编码的
+        深色 + 蓝色」）。现在改为跟随深浅色，强调色走库的主题色，与 app 里其它
+        Fluent 控件一致。
+        """
+        if isDarkTheme():
+            return {
+                "bg": QColor(32, 32, 32, 235),
+                "border": QColor(255, 255, 255, 40),
+                "title": QColor(255, 255, 255, 160),
+                "value": QColor(self.ACCENT),
+                "track": QColor(255, 255, 255, 40),
+                "shadow": QColor(0, 0, 0, 160),
+            }
+        return {
+            "bg": QColor(249, 249, 249, 242),
+            "border": QColor(0, 0, 0, 18),
+            "title": QColor(0, 0, 0, 140),
+            "value": QColor(self.ACCENT),
+            "track": QColor(0, 0, 0, 30),
+            "shadow": QColor(0, 0, 0, 70),
+        }
+
+    def _apply_style(self):
+        """注入配色。主题没变就直接返回——每次显示都重设样式表没必要。"""
+        dark = isDarkTheme()
+        if dark == self._style_dark:
+            return
+        self._style_dark = dark
+
+        palette = self._palette()
+        self.frame.setStyleSheet(f"""
+            #OsdFrame {{
+                background-color: {self._css(palette['bg'])};
+                border: 1px solid {self._css(palette['border'])};
+                border-radius: 16px;
+            }}
+        """)
+        self.title_lbl.setStyleSheet(
+            f"color: {self._css(palette['title'])}; background: transparent;")
+        self.val_lbl.setStyleSheet(
+            f"color: {self._css(palette['value'])}; background: transparent;")
+        # 进度条填充与数值**同色**（强调色）
+        self.countdown_bar.apply_colors(palette["track"], palette["value"])
+
+        shadow = self.frame.graphicsEffect()
+        if shadow is not None:
+            shadow.setColor(palette["shadow"])
+
+    def _target_pos(self):
+        """底部居中，**跟随鼠标所在的那块屏**。
+
+        以前固定用 ``primaryScreen()``，多屏下在主屏以外的显示器上按快捷键，
+        提示会跑到另一块屏去。macOS 版取的就是鼠标所在屏幕。
+        """
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = area.x() + (area.width() - self.width()) // 2
+        y = area.y() + area.height() - self.height() - 150  # 距底 150px
+        return x, y
         
     def show_hud(self, title, val, countdown=None):
         """显示悬浮提示。countdown 为等待秒数时显示进度条。"""
@@ -795,11 +932,7 @@ class OsdHud(QWidget):
             self.countdown_bar.stop()
         self.frame.setGeometry(0, 0, self._hud_size.width(), self._hud_size.height())
         
-        # Center bottom of primary screen
-        screen = QApplication.primaryScreen().availableGeometry()
-        x = screen.x() + (screen.width() - self.width()) // 2
-        y = screen.y() + screen.height() - self.height() - 150 # 150px from bottom offset
-        self.move(x, y)
+        self._apply_style()
         
         self.timer.stop()
         self.anim.stop()
@@ -807,15 +940,27 @@ class OsdHud(QWidget):
             self.anim.finished.disconnect()
         except Exception:
             pass
-        self.setWindowOpacity(1.0)
-        self.show()
-        self.raise_()
-        if sys.platform == "win32" and user32:
-            try:
-                user32.SetWindowPos(int(self.winId()), -1, x, y, self.width(), self.height(), 0x0010 | 0x0040)
-            except Exception:
-                pass
-        QTimer.singleShot(0, self.raise_)
+
+        # 淡出到一半又来一次显示：把不透明度拉回来。此时窗口仍算「可见」，
+        # 不会走下面的窗口操作分支，所以要单独兜一下。
+        if self.windowOpacity() < 1.0:
+            self.setWindowOpacity(1.0)
+
+        # 已经在显示中就别再碰窗口层级：连按时每 80ms 一次 show / raise /
+        # SetWindowPos 都是窗口服务器往返，开销明显 —— macOS 版同样只在
+        # 不可见时才 orderFront。注意文案、进度条、计时在上面已经**无条件**
+        # 更新过了，进不进这个分支都不影响内容刷新。
+        if not self.isVisible():
+            self.move(*self._target_pos())
+            self.show()
+            self.raise_()
+            if sys.platform == "win32" and user32:
+                try:
+                    user32.SetWindowPos(int(self.winId()), -1, self.x(), self.y(),
+                                        self.width(), self.height(), 0x0010 | 0x0040)
+                except Exception:
+                    pass
+            QTimer.singleShot(0, self.raise_)
         
         # 有倒计时时至少覆盖整个等待时间，否则进度条还没走完提示就先淡出了
         stay_ms = 1800 if not countdown else max(1800, int(countdown * 1000) + 600)

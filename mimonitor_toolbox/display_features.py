@@ -76,6 +76,7 @@ class DisplayFeaturesMixin:
             state_val = getattr(state, "value", 0)
         enabled = state_val == Qt.CheckState.Checked.value
         update_settings({"hotkey_countdown_enabled": enabled})
+        self._sync_countdown_enabled_ui(enabled)
         self.log(f"快捷键松手后生效（倒计时）: {'开启' if enabled else '关闭（按下立即下发）'}")
 
     def _cycle_action_catalog(self):
@@ -431,11 +432,10 @@ class DisplayFeaturesMixin:
         curr_val = pending.get("value", self._get_adjustable_display_value(cfg))
         delta = step if direction == "increase" else -step
         next_val = max(cfg["min"], min(cfg["max"], curr_val + delta))
-        value_name = str(next_val)
 
-        if getattr(self, "osd", None):
-            self.osd.show_hud(cfg["label"], value_name)
-
+        # 这里**不**单独弹一次提示：紧接着的 _stage_adjustable_display_value
+        # 会用同样的文案再弹一次（并且带上倒计时条）。以前两处都弹，等于每按
+        # 一次调节快捷键都多做一轮无谓的窗口操作。
         try:
             self._stage_adjustable_display_value(param, cfg, next_val)
         except Exception as e:

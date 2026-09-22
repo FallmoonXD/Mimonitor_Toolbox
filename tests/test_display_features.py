@@ -289,6 +289,31 @@ class HotkeyCountdownTests(unittest.TestCase):
 
         osd.end_countdown.assert_called_once()
 
+    def test_adjust_hotkey_pops_hud_once(self):
+        """回归：调节类快捷键以前会弹两次悬浮提示 —— 一次无倒计时、紧接着
+        又一次带倒计时。前者完全是多余的，每按一次都多做一轮窗口操作。"""
+        from mimonitor_toolbox import display_features
+
+        osd = mock.Mock()
+        host = self._host({}, osd=osd)
+        host.adb_connected = True
+        host._adjust_hotkey_resolving = set()
+        host.current_vals["picture_backlight"] = 50
+        settings = {"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.8}
+
+        with mock.patch.object(display_features, "load_settings",
+                               side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_stage_adjustable_display_value") as stage:
+            host.trigger_adjust_hotkey(
+                {"param": "backlight", "direction": "increase", "step": 5})
+
+        # trigger_adjust_hotkey 自己不再弹；提示由 _stage_adjustable_display_value
+        # 内部那一次（带倒计时）负责
+        osd.show_hud.assert_not_called()
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args.args[0], "backlight")
+        self.assertEqual(stage.call_args.args[2], 55, "50 + 5")
+
 
 if __name__ == "__main__":
     unittest.main()

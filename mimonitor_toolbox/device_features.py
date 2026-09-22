@@ -766,6 +766,11 @@ class DeviceFeaturesMixin:
             async_run(do)
 
     def _auto_connect_on_startup(self):
+        # 和其它周期定时器一样先看清理标记：它由 QTimer.singleShot(900) 排程，
+        # 程序退出（或测试里窗口已销毁）后还会被事件循环翻出来，那时再去连设备
+        # 或扫内网就晚了 —— 会留下一串指向已销毁对象的 adb 进程。
+        if getattr(self, "_cleanup_done", False) or getattr(self, "_windows_session_ending", False):
+            return
         if getattr(self, "adb_connected", False):
             return
 
