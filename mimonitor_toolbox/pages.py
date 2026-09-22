@@ -11,12 +11,15 @@ import time
 from PyQt6.QtCore import QSize, Qt, QTimer
 from PyQt6.QtGui import QColor, QIcon
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QSizePolicy,
     QSystemTrayIcon,
     QTextEdit,
@@ -38,9 +41,11 @@ from qfluentwidgets import (
     SimpleCardWidget,
     Slider,
     SubtitleLabel,
+    SwitchButton,
     Theme,
     TitleLabel,
     ToggleButton,
+    TransparentToolButton,
     setTheme,
 )
 
@@ -52,7 +57,11 @@ from .core import (
     load_settings,
     update_settings,
 )
-from .widgets import PageScrollSlider
+from .widgets import TRAY_ROW_HEIGHT, PageScrollSlider, TrayItemList
+
+
+# 行高常量（TRAY_ROW_HEIGHT）由 widgets.TrayRowDelegate 拥有，这里只定义可见行数上限
+TRAY_VISIBLE_ROWS = 8
 
 
 class PagesMixin:
@@ -62,6 +71,7 @@ class PagesMixin:
         self.game_page = self._make_game_page()
         self.source_page = self._make_source_page()
         self.light_page = self._make_light_page()
+        self.tray_page = self._make_tray_page()
         self.tools_page = self._make_tools_page()
         self.remote_page = self._make_remote_page()
 
@@ -70,6 +80,7 @@ class PagesMixin:
         self.game_page.setObjectName("gamePage")
         self.source_page.setObjectName("sourcePage")
         self.light_page.setObjectName("lightPage")
+        self.tray_page.setObjectName("trayPage")
         self.tools_page.setObjectName("toolsPage")
         self.remote_page.setObjectName("remotePage")
 
@@ -79,6 +90,7 @@ class PagesMixin:
         self.addSubInterface(self.game_page, FIF.GAME, "游戏模式")
         self.addSubInterface(self.source_page, FIF.SYNC, "信号源切换")
         self.addSubInterface(self.light_page, FIF.BRIGHTNESS, "屏幕灯")
+        self.addSubInterface(self.tray_page, FIF.MENU, "托盘菜单")
         self.addSubInterface(self.tools_page, FIF.DEVELOPER_TOOLS, "工具与设置")
         self.addSubInterface(self.remote_page, FIF.TILES, "遥控器")
 
@@ -518,6 +530,187 @@ class PagesMixin:
         scroll.setWidget(container)
         return scroll
 
+    # ── 托盘快捷菜单自定义 ────────────────────────────────────────
+
+    # ── 托盘快捷菜单自定义 ────────────────────────────────────────
+    # 「已加入」用纯 item + TrayRowDelegate（行内 ▲▼✕ 由委托绘制），
+    # 「可添加」只在构建时建一次，之后仅同步开关状态。
+
+    def _tray_add_item(self, entry_id):
+        ids = self._tray_item_ids()
+        if entry_id not in ids:
+            ids.append(entry_id)
+            update_settings({"tray_items": ids})
+        self._tray_sync_both()
+
+    def _tray_remove_item(self, entry_id):
+        ids = [i for i in self._tray_item_ids() if i != entry_id]
+        update_settings({"tray_items": ids})
+        self._tray_sync_both()
+
+    def _tray_move_item(self, entry_id, delta):
+        ids = self._tray_item_ids()
+        if entry_id not in ids:
+            return
+        index = ids.index(entry_id)
+        target = max(0, min(len(ids) - 1, index + delta))
+        if target == index:
+            return
+        ids.insert(target, ids.pop(index))
+        update_settings({"tray_items": ids})
+        # 顺序变了只需刷新左侧列表，右侧开关状态不变
+        self._tray_sync_enabled()
+
+    def _tray_sync_both(self):
+        self._tray_sync_enabled()
+        self._tray_sync_switches()
+
+    def _tray_ordered_ids(self):
+        entries = {e["id"]: e for e in self.tray_entry_catalog()}
+        return [i for i in self._tray_item_ids() if i in entries]
+
+    def _tray_sync_enabled(self):
+        """重建「已加入」列表的 items（纯 item，开销极小）。"""
+        widget = getattr(self, "tray_enabled_list", None)
+        if widget is None:
+            return
+        entries = {e["id"]: e for e in self.tray_entry_catalog()}
+        ids = self._tray_ordered_ids()
+
+        previous = getattr(self, "_tray_suppress_reorder", False)
+        self._tray_suppress_reorder = True
+        try:
+            widget.clear()
+            for entry_id in ids:
+                item = QListWidgetItem(entries[entry_id]["label"], widget)
+                item.setSizeHint(QSize(0, TRAY_ROW_HEIGHT))
+                item.setData(Qt.ItemDataRole.UserRole, entry_id)
+                widget.addItem(item)
+        finally:
+            self._tray_suppress_reorder = previous
+
+        self._tray_apply_list_height()
+        if getattr(self, "tray_empty_hint", None) is not None:
+            self.tray_empty_hint.setVisible(not ids)
+        if getattr(self, "tray_enabled_title", None) is not None:
+            self.tray_enabled_title.setText(f"已加入（{len(ids)}）")
+
+    def _tray_apply_list_height(self):
+        """高度按实际行高求和；超过上限则封顶并启用内部滚动条。"""
+        widget = getattr(self, "tray_enabled_list", None)
+        if widget is None:
+            return
+        total = sum(widget.sizeHintForRow(i) for i in range(widget.count()))
+        capped = min(total, TRAY_VISIBLE_ROWS * TRAY_ROW_HEIGHT)
+        widget.setFixedHeight(capped)
+        widget.setVisible(widget.count() > 0)
+        needs_scroll = total > capped
+        widget.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded if needs_scroll
+            else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+
+    def _tray_sync_switches(self):
+        """同步「可添加」的开关状态。控件只建一次，切换时只改状态。
+
+        不重建：重建会重置开关动画、让鼠标下的控件消失，若 connect 早于
+        setChecked 还会造成递归。
+        """
+        ids = set(self._tray_ordered_ids())
+        for entry_id, switch in getattr(self, "_tray_switches", {}).items():
+            was_blocked = switch.blockSignals(True)
+            try:
+                switch.setChecked(entry_id in ids)
+            finally:
+                switch.blockSignals(was_blocked)
+
+    def _on_tray_reordered(self):
+        """拖动结束后落盘（内部拖动不发 rowsMoved，只能在 startDrag 之后取）。"""
+        if getattr(self, "_tray_suppress_reorder", False):
+            return
+        widget = getattr(self, "tray_enabled_list", None)
+        if widget is None:
+            return
+        ordered = [
+            widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(widget.count())
+        ]
+        ordered = [i for i in ordered if i]
+        if ordered and ordered != self._tray_item_ids():
+            update_settings({"tray_items": ordered})
+
+    def _make_tray_page(self):
+        scroll = ScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        container = QWidget()
+        container.setObjectName("Container")
+        container.setStyleSheet("#Container { background: transparent; }")
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(30, 20, 30, 20)
+        layout.setSpacing(14)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        layout.addWidget(SubtitleLabel("托盘菜单", container))
+
+        # ── 已加入（拖动 / ▲▼ 排序，行内 ✕ 移除）──
+        enabled_card = SimpleCardWidget(container)
+        enabled_layout = QVBoxLayout(enabled_card)
+        enabled_layout.setContentsMargins(24, 18, 24, 18)
+        enabled_layout.setSpacing(12)
+
+        self.tray_enabled_title = SubtitleLabel("已加入", enabled_card)
+        enabled_layout.addWidget(self.tray_enabled_title)
+
+        self.tray_enabled_list = TrayItemList(enabled_card)
+        self.tray_enabled_list.setToolTip("按住条目拖动可调整顺序")
+        self.tray_enabled_list.remove_requested.connect(self._tray_remove_item)
+        self.tray_enabled_list.move_requested.connect(self._tray_move_item)
+        self.tray_enabled_list.reorder_finished.connect(self._on_tray_reordered)
+        enabled_layout.addWidget(self.tray_enabled_list)
+
+        self.tray_empty_hint = BodyLabel("还没有添加。从下面挑几个吧。", enabled_card)
+        self.tray_empty_hint.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
+        enabled_layout.addWidget(self.tray_empty_hint)
+        layout.addWidget(enabled_card)
+
+        # ── 可添加（只建一次）──
+        available_card = SimpleCardWidget(container)
+        available_layout = QVBoxLayout(available_card)
+        available_layout.setContentsMargins(24, 18, 24, 18)
+        available_layout.setSpacing(10)
+        available_layout.addWidget(SubtitleLabel("可添加", available_card))
+
+        rows_layout = QVBoxLayout()
+        rows_layout.setSpacing(0)
+        self._tray_switches = {}
+        for entry in self.tray_entry_catalog():
+            row = QWidget(available_card)
+            row.setFixedHeight(TRAY_ROW_HEIGHT)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(2, 0, 2, 0)
+            row_layout.setSpacing(8)
+            row_layout.addWidget(BodyLabel(entry["label"], row))
+            row_layout.addStretch(1)
+            switch = SwitchButton(row)
+            switch.setOnText("开")
+            switch.setOffText("关")
+            switch.checkedChanged.connect(
+                lambda checked, eid=entry["id"]: (
+                    self._tray_add_item(eid) if checked else self._tray_remove_item(eid)
+                )
+            )
+            row_layout.addWidget(switch)
+            rows_layout.addWidget(row)
+            self._tray_switches[entry["id"]] = switch
+        available_layout.addLayout(rows_layout)
+        layout.addWidget(available_card)
+
+        self.tray_menu_page_container = container
+        self._tray_sync_both()
+        scroll.setWidget(container)
+        return scroll
+
     def _make_tools_page(self):
         scroll = ScrollArea(self)
         scroll.setWidgetResizable(True)
@@ -940,6 +1133,21 @@ class PagesMixin:
         btn_add_adjust_hotkey.clicked.connect(lambda: add_adjust_hotkey_row())
         c4_lay.addWidget(btn_add_adjust_hotkey)
             
+        # 松手后生效（倒计时）：连按时只有最后一次的值落到显示器，
+        # 等待期间悬浮提示会显示倒计时进度条。
+        countdown_row = QHBoxLayout()
+        countdown_row.setSpacing(12)
+        self.chk_hotkey_countdown = CheckBox("快捷键松手后生效（倒计时）", card4)
+        self.chk_hotkey_countdown.setChecked(settings.get("hotkey_countdown_enabled", True))
+        self.chk_hotkey_countdown.stateChanged.connect(self._toggle_hotkey_countdown)
+        countdown_row.addWidget(self.chk_hotkey_countdown)
+        countdown_row.addStretch(1)
+        c4_lay.addLayout(countdown_row)
+        c4_lay.addWidget(CaptionLabel(
+            "* 关闭后每次按键立即下发（更跟手，但连按会把 ADB 命令堆起来）。",
+            card4,
+        ))
+
         btn_save_hotkeys = PrimaryPushButton(FIF.TAG, "保存并应用全局快捷键", card4)
         c4_lay.addWidget(btn_save_hotkeys)
         

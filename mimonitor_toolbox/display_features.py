@@ -54,59 +54,168 @@ class DisplayFeaturesMixin:
             lambda: self._refresh_picture_data_after_hdr_change()
         )
 
-    def trigger_hotkey_action(self, action):
-        if not getattr(self, "adb_connected", False):
-            return
-            
-        if action == "local_dimming_toggle_off":
-            self._toggle_local_dimming_off_hotkey()
-            return
-            
-        actions_map = {
-            "picture_mode_cycle": (
+    def hotkey_countdown_enabled(self):
+        return bool(load_settings().get("hotkey_countdown_enabled", True))
+
+    def hotkey_countdown_seconds(self):
+        try:
+            return max(0.1, float(load_settings().get("hotkey_countdown_seconds", 0.8)))
+        except (TypeError, ValueError):
+            return 0.8
+
+    def effective_hotkey_delay(self):
+        """快捷键实际生效前等待多久（秒）。0 表示不等待、按下即下发。"""
+        if not self.hotkey_countdown_enabled():
+            return 0.0
+        return self.hotkey_countdown_seconds()
+
+    def _toggle_hotkey_countdown(self, state):
+        try:
+            state_val = int(state)
+        except Exception:
+            state_val = getattr(state, "value", 0)
+        enabled = state_val == Qt.CheckState.Checked.value
+        update_settings({"hotkey_countdown_enabled": enabled})
+        self.log(f"快捷键松手后生效（倒计时）: {'开启' if enabled else '关闭（按下立即下发）'}")
+
+    def _cycle_action_catalog(self):
+        """取值型动作目录：快捷键循环与托盘菜单共用同一份定义。
+
+        每项为 (取值键, [(值, 名称), ...], 显示名, 执行函数)。
+        """
+        return {
+            "picture_mode": (
                 "picture_mode",
                 [(14, "标准"), (10, "游戏"), (9, "电影")],
                 "画面模式",
                 lambda val, name: self._set_mode(val, name)
             ),
-            "local_dimming_cycle": (
+            "local_dimming": (
                 "picture_local_dimming",
                 [(0, "关"), (1, "低"), (2, "中"), (3, "高")],
                 "精密控光",
                 lambda val, name: self._jni("g_video__vid_local_dimming", val, "picture_local_dimming", f"精密控光: {name}", "tv_picture_video_local_dimming")
             ),
-            "color_space_cycle": (
+            "color_space": (
                 "tv_picture_advanced_video_color_space",
                 [(0, "自动"), (3, "sRGB"), (6, "DCI-P3"), (4, "AdobeRGB"), (5, "BT2020"), (7, "BT709")],
                 "色域",
                 lambda val, name: self._jni("g_video__vid_gamut_mapping_mode", val, "tv_picture_advanced_video_color_space", f"色域: {name}", "tv_picture_video_color_space")
             ),
-            "color_temp_cycle": (
+            "color_temp": (
                 "picture_color_temperature",
                 [(0, "冷色"), (1, "标准"), (2, "暖色"), (8, "原色"), (3, "自定义")],
                 "色温",
                 lambda val, name: self._set_color_temp(XIAOMI_TO_MTK_COLOR_TEMP.get(val, 2), val, f"色温: {name}")
             ),
-            "response_time_cycle": (
+            "response_time": (
                 "picture_response_time",
                 [(1, "普通"), (2, "快速"), (3, "高速")],
                 "灰阶响应时间",
                 lambda val, name: self._jni("g_video__vid_od_response_time", val, "picture_response_time", f"响应时间: {name}")
             ),
-            "freesync_toggle": (
+            "freesync": (
                 "freesync",
                 [(0, "关"), (1, "开")],
                 "FreeSync",
                 lambda val, name: self._fsync(val == 1)
             ),
-            "input_source_cycle": (
+            "input_source": (
                 "mitv.tvplayer.hdmi.last.source",
                 [(23, "HDMI 1"), (24, "HDMI 2"), (29, "DP"), (30, "USBC")],
                 "信号源切换",
                 lambda val, name: self._set("mitv.tvplayer.hdmi.last.source", val, f"信号源: {name}")
             )
         }
-        
+
+    def tray_entry_catalog(self):
+        """托盘右键菜单可选的条目目录。
+
+        两类：取值型（复用快捷键的循环动作定义）与数值型（复用可调快捷键参数，
+        菜单里只给「增大 / 减小」，不把 1~100 全铺开）。
+        """
+        entries = []
+        for entry_id, (_sk, options, label, _exec) in self._cycle_action_catalog().items():
+            entries.append({
+                "id": entry_id,
+                "label": label,
+                "kind": "options",
+                "options": list(options),
+            })
+        for param, cfg in ADJUSTABLE_HOTKEY_PARAMS.items():
+            entries.append({
+                "id": param,
+                "label": cfg.get("label", param),
+                "kind": "stepper",
+                "min": cfg.get("min", 0),
+                "max": cfg.get("max", 100),
+                "step": cfg.get("step", 1),
+            })
+        return entries
+
+    def tray_entry(self, entry_id):
+        for entry in self.tray_entry_catalog():
+            if entry["id"] == entry_id:
+                return entry
+        return None
+
+    def tray_entry_value(self, entry_id):
+        """该条目当前值（供菜单打勾）。未知时返回 None。"""
+        entry = self.tray_entry(entry_id)
+        if not entry:
+            return None
+        if entry["kind"] == "options":
+            key = self._cycle_action_catalog()[entry_id][0]
+        else:
+            key = ADJUSTABLE_HOTKEY_PARAMS[entry_id].get("setting")
+        raw = getattr(self, "current_vals", {}).get(key)
+        if raw in (None, "", "null", "N/A"):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def tray_apply_option(self, entry_id, value):
+        """托盘菜单里选中某个取值。"""
+        if not getattr(self, "adb_connected", False):
+            return
+        catalog = self._cycle_action_catalog()
+        if entry_id not in catalog:
+            return
+        _sk, options, _label, exec_fn = catalog[entry_id]
+        name = next((n for v, n in options if v == value), str(value))
+        exec_fn(value, name)
+
+    def tray_set_value(self, entry_id, value):
+        """托盘菜单里拖动滑块设定数值型条目的值（去抖提交）。"""
+        if not getattr(self, "adb_connected", False):
+            return
+        cfg = ADJUSTABLE_HOTKEY_PARAMS.get(entry_id)
+        if not cfg:
+            return
+        target = max(cfg.get("min", 0), min(cfg.get("max", 100), int(value)))
+        self._stage_adjustable_display_value(entry_id, cfg, target, show_hud=False)
+
+    def trigger_hotkey_action(self, action):
+        if not getattr(self, "adb_connected", False):
+            return
+
+        if action == "local_dimming_toggle_off":
+            self._toggle_local_dimming_off_hotkey()
+            return
+
+        catalog = self._cycle_action_catalog()
+        actions_map = {
+            "picture_mode_cycle": catalog["picture_mode"],
+            "local_dimming_cycle": catalog["local_dimming"],
+            "color_space_cycle": catalog["color_space"],
+            "color_temp_cycle": catalog["color_temp"],
+            "response_time_cycle": catalog["response_time"],
+            "freesync_toggle": catalog["freesync"],
+            "input_source_cycle": catalog["input_source"],
+        }
+
         if action not in actions_map:
             return
 
@@ -135,16 +244,24 @@ class DisplayFeaturesMixin:
             "exec": exec_fn,
         }
         self._preview_cycle_hotkey_value(sk, next_val)
+
+        delay = self.effective_hotkey_delay()
         if getattr(self, "osd", None):
-            self.osd.show_hud(label_name, next_name)
+            # 等待期间显示倒计时进度条；关闭倒计时则不带进度条
+            self.osd.show_hud(label_name, next_name, countdown=delay or None)
 
         timer = self._cycle_hotkey_timers.get(action)
         if timer is None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.setInterval(450)
             timer.timeout.connect(lambda a=action: self._commit_cycle_hotkey_action(a))
             self._cycle_hotkey_timers[action] = timer
+        timer.stop()
+        if delay <= 0:
+            # 关掉倒计时：立即下发，不等
+            self._commit_cycle_hotkey_action(action)
+            return
+        timer.setInterval(int(delay * 1000))
         timer.start()
 
     def _preview_cycle_hotkey_value(self, sk, value):
@@ -158,6 +275,8 @@ class DisplayFeaturesMixin:
         self.values_signal.emit({sk: value})
 
     def _commit_cycle_hotkey_action(self, action):
+        if getattr(self, "osd", None):
+            self.osd.end_countdown()
         pending = self._cycle_hotkey_pending.pop(action, None)
         if not pending or not getattr(self, "adb_connected", False):
             return
@@ -322,7 +441,11 @@ class DisplayFeaturesMixin:
         except Exception as e:
             self.log(f"可调快捷键执行失败: {e}")
 
-    def _stage_adjustable_display_value(self, param, cfg, value):
+    def _stage_adjustable_display_value(self, param, cfg, value, show_hud=True):
+        """暂存一次数值调整并去抖提交。
+
+        show_hud=False 用于托盘滑块——菜单里已经内联显示数值，再弹悬浮窗是重复。
+        """
         setting = cfg["setting"]
         raw_value = value - int(cfg.get("ui_offset", 0))
 
@@ -340,16 +463,28 @@ class DisplayFeaturesMixin:
             self.values_signal.emit({setting: value})
 
         self._adjust_hotkey_pending[param] = {"cfg": cfg, "value": value}
+
+        delay = self.effective_hotkey_delay()
+        if show_hud and getattr(self, "osd", None):
+            label = cfg.get("label", param)
+            self.osd.show_hud(label, str(value), countdown=delay or None)
+
         timer = self._adjust_hotkey_timers.get(param)
         if timer is None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.setInterval(450)
             timer.timeout.connect(lambda p=param: self._commit_pending_adjustment(p))
             self._adjust_hotkey_timers[param] = timer
+        timer.stop()
+        if delay <= 0:
+            self._commit_pending_adjustment(param)
+            return
+        timer.setInterval(int(delay * 1000))
         timer.start()
 
     def _commit_pending_adjustment(self, param):
+        if getattr(self, "osd", None):
+            self.osd.end_countdown()
         pending = self._adjust_hotkey_pending.pop(param, None)
         if not pending or not getattr(self, "adb_connected", False):
             return

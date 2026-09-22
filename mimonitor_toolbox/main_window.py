@@ -7,10 +7,17 @@ import sys
 import threading
 import time
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QRect, QTimer, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMenu, QSystemTrayIcon
-from qfluentwidgets import FluentWindow, MessageBox
+from qfluentwidgets import (
+    Action,
+    FluentIcon as FIF,
+    FluentWindow,
+    MenuAnimationType,
+    MenuIndicatorType,
+    MessageBox,
+)
 
 from . import adb as adb_runtime
 from .adb import (
@@ -35,7 +42,13 @@ from .core import (
 from .device_features import DeviceFeaturesMixin
 from .display_features import DisplayFeaturesMixin
 from .pages import PagesMixin
-from .widgets import CloseConfirmDialog, OsdHud
+from .widgets import (
+    CloseConfirmDialog,
+    OsdHud,
+    TrayMenu,
+    TrayOptionMenu,
+    TraySliderCard,
+)
 from .windows import (
     MOD_ALT,
     MOD_CONTROL,
@@ -170,27 +183,111 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
         self.tray_icon.setIcon(icon)
         self.setWindowIcon(icon)
         self.tray_icon.setToolTip("红米 G Pro 27U Toolbox")
-        
-        menu = QMenu()
-        show_action = QAction("显示主窗口", self)
-        show_action.triggered.connect(self.show_and_raise)
-        
-        exit_action = QAction("退出程序", self)
-        exit_action.triggered.connect(self.force_exit)
-        
-        menu.addAction(show_action)
-        menu.addSeparator()
-        menu.addAction(exit_action)
-        
-        self.tray_icon.setContextMenu(menu)
+
+        # 不调用 setContextMenu：那样右键会被 Qt 直接接管、activated 收不到
+        # Context，也无法在每次弹出前重建菜单（打勾需要反映最新值）。
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
-    def show_and_raise(self):
-        self._restore_main_window()
-        QTimer.singleShot(0, self._restore_main_window)
-        QTimer.singleShot(120, self._restore_main_window)
-        QTimer.singleShot(250, self._check_adb_when_restored)
+    def _tray_item_ids(self):
+        ids = load_settings().get("tray_items", [])
+        if not isinstance(ids, list):
+            return []
+        return [str(i) for i in ids]
+
+    def _tray_submenu_icon(self, entry_id):
+        candidates = {
+            "picture_mode": "VIEW", "local_dimming": "BRIGHTNESS",
+            "color_space": "PALETTE", "color_temp": "CONSTRACT",
+            "response_time": "SPEED_HIGH", "freesync": "SYNC",
+            "input_source": "LINK", "backlight": "BRIGHTNESS",
+            "black_level": "PHOTO", "contrast": "CONSTRACT",
+            "saturation": "PALETTE", "hue": "PALETTE",
+            "sharpness": "ZOOM", "red_gain": "PALETTE",
+            "green_gain": "PALETTE", "blue_gain": "PALETTE",
+            "atmosphere_illumination": "BRIGHTNESS",
+        }
+        name = candidates.get(entry_id)
+        return getattr(FIF, name) if name else None
+
+    def build_tray_menu(self):
+        """构建 Fluent 风格托盘菜单。每次弹出前重建，保证打勾是当前值。"""
+        menu = TrayMenu(parent=self)
+
+        status_action = Action(self.status_label.text() or "未连接", menu)
+        status_action.setEnabled(False)
+        menu.addAction(status_action)
+        menu.addSeparator()
+
+        entries = {e["id"]: e for e in self.tray_entry_catalog()}
+        configured = [i for i in self._tray_item_ids() if i in entries]
+        if not configured:
+            empty = Action("还没添加快捷项，去「工具与设置」里挑几个", menu)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+        for entry_id in configured:
+            entry = entries[entry_id]
+            current = self.tray_entry_value(entry_id)
+            icon = self._tray_submenu_icon(entry_id)
+            if entry["kind"] == "options":
+                submenu = TrayOptionMenu(
+                    entry["label"], parent=menu, indicatorType=MenuIndicatorType.RADIO
+                )
+                for value, name in entry["options"]:
+                    act = Action(icon, name, submenu) if icon is not None else Action(name, submenu)
+                    act.setCheckable(True)
+                    if current is not None and int(current) == int(value):
+                        act.setChecked(True)
+                    act.triggered.connect(
+                        lambda _checked=False, eid=entry_id, v=value: self.tray_apply_option(eid, v)
+                    )
+                    submenu.addAction(act)
+                if icon is not None:
+                    submenu.setIcon(icon.icon())
+                menu.addMenu(submenu)
+            else:
+                # 数值条目：菜单行保留「标签   数值」，悬停弹出独立圆角浮条
+                # （TraySliderCard）。数值就显示在这一行，拖动时实时同步。
+                card = TraySliderCard(
+                    icon,
+                    entry["label"],
+                    entry["min"],
+                    entry["max"],
+                    current if current is not None else entry["min"],
+                    # 走 lambda 延迟查找 self.tray_set_value：直接传方法引用会在构造时
+                    # 就绑死，测试里 patch 不掉（也拿不到后续替换）
+                    on_change=lambda eid, value: self.tray_set_value(eid, value),
+                    step=entry.get("step"),
+                    entry_id=entry_id,
+                    parent=menu,
+                )
+                card.set_connected(self.adb_connected)
+                if icon is not None:
+                    # addMenu 画的是 menu.icon()，不设的话这一行就没有图标，
+                    # 和取值型行不一致
+                    card.setIcon(icon.icon())
+                menu.addMenu(card)
+                # 行宽预留到取值范围内最长那一档，拖到 99→100 不会撑开菜单
+                card.sync_row_text(card.value())
+
+        menu.addSeparator()
+        show_action = Action(FIF.HOME, "显示主窗口", menu)
+        show_action.triggered.connect(self.show_and_raise)
+        menu.addAction(show_action)
+        exit_action = Action(FIF.POWER_BUTTON, "退出程序", menu)
+        exit_action.triggered.connect(self.force_exit)
+        menu.addAction(exit_action)
+        return menu
+
+    def popup_tray_menu(self):
+        # 每次弹出都重建（打勾要反映最新值），旧的显式释放避免累积
+        previous = getattr(self, "_tray_menu", None)
+        if previous is not None:
+            previous.deleteLater()
+        self._tray_menu = self.build_tray_menu()
+        # ani=False 在库里其实没被使用，必须传 aniType=NONE 才真的不播放动画；
+        # 子菜单同理，见 TrayOptionMenu / TraySliderCard
+        self._tray_menu.exec(QCursor.pos(), aniType=MenuAnimationType.NONE)
 
     def _check_adb_when_restored(self):
         if getattr(self, "adb_connected", False) and getattr(self.adb, "ip", ""):
@@ -221,7 +318,17 @@ class App(PagesMixin, DisplayFeaturesMixin, DeviceFeaturesMixin, FluentWindow):
             except Exception:
                 pass
 
+    def show_and_raise(self):
+        self._restore_main_window()
+        QTimer.singleShot(0, self._restore_main_window)
+        QTimer.singleShot(120, self._restore_main_window)
+        QTimer.singleShot(250, self._check_adb_when_restored)
+
+
     def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Context:
+            self.popup_tray_menu()
+            return
         if reason == QSystemTrayIcon.ActivationReason.Trigger or reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             is_minimized = bool(self.windowState() & Qt.WindowState.WindowMinimized)
             if self.isVisible() and not is_minimized:

@@ -3,22 +3,31 @@
 import sys
 
 from PyQt6.QtCore import (
-    QEvent,
     QEasingCurve,
+    QEvent,
     QObject,
+    QPoint,
     QPropertyAnimation,
+    QRect,
     QSize,
     Qt,
     QTimer,
+    pyqtProperty,
+    pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QDrag, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QDialog,
+    QStyledItemDelegate,
+    QStyle,
     QFrame,
     QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -26,13 +35,22 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel,
     CaptionLabel,
+    CheckableMenu,
+    MenuAnimationType,
     CheckBox,
+    FluentIcon as FIF,
+    IconWidget,
     PrimaryPushButton,
-    ProgressBar,
     PushButton,
+    RoundMenu,
     Slider,
     SubtitleLabel,
+    SystemTrayMenu,
+    Theme,
+    drawIcon,
+    isDarkTheme,
 )
+from qfluentwidgets.common import getFont
 
 from .windows import user32
 
@@ -42,6 +60,669 @@ class OverlayResizeFilter(QObject):
             for child in obj.findChildren(QWidget, "_loading_overlay"):
                 child.setGeometry(obj.rect())
         return super().eventFilter(obj, event)
+class TraySliderRow(QWidget):
+    """浮条卡片的内容一行：图标 + 名称 + 滑杆（滑杆 stretch 占满剩余宽度）。
+
+    数值**不画在这一行**：按需求，数值只留在托盘菜单那一行条目上
+    （「背光   50」），拖动时由 :class:`TraySliderCard` 同步过去。
+
+    取值语义与主窗口的页面滑杆（``PageScrollSlider``）保持一致：**连续取值，
+    不做步长吸附**。之前这里沿用了快捷键的 ``step`` 当吸附网格，结果是拖动时
+    手柄被来回弹（拖到 94~98 全被拽回 96、到 99 又跳 100），既抖又让「96 和
+    100 看起来一样」——网格只有 21 档，末端两档还只差 4。``step`` 现在只用于
+    键盘方向键的单步增量。
+
+    其余几条也是踩过坑攒下的：
+
+    * ``set_value(..., notify=False)`` 只改显示、不回调；
+    * 断连时禁用滑杆并把整行压暗。
+    """
+
+    HEIGHT = 44
+    ICON_SIZE = 20
+    CARD_WIDTH = 420
+    DISCONNECTED_OPACITY = 0.4
+
+    def __init__(self, icon, label, minimum, maximum, value, on_change=None,
+                 step=None, entry_id="", parent=None):
+        super().__init__(parent)
+        self._entry_id = str(entry_id)
+        self._on_change = on_change
+        self._step = max(1, int(step)) if step else 1
+        self._min = int(minimum)
+        self._max = max(int(maximum), int(minimum) + 1)
+        self._connected = True
+        self._dim_effect = None
+
+        self.setFixedSize(self.CARD_WIDTH, self.HEIGHT)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setSpacing(12)
+
+        # 图标交给 IconWidget：它内部按 isDarkTheme() 走 drawIcon，深浅色自适配
+        self.icon_widget = IconWidget(icon if icon is not None else QIcon(), self)
+        self.icon_widget.setFixedSize(self.ICON_SIZE, self.ICON_SIZE)
+        layout.addWidget(self.icon_widget)
+
+        # 名称用自然宽度：同一时刻只显示一张浮条（悬停哪条显示哪条），不会
+        # 并排比较；定宽只会给「背光」这种短名字留出一大块死区。卡片外宽由
+        # CARD_WIDTH 统一，多出来的宽度全部给滑杆。
+        self.label = BodyLabel(label, self)
+        layout.addWidget(self.label)
+
+        self.slider = Slider(Qt.Orientation.Horizontal, self)
+        self.slider.setRange(self._min, self._max)
+        self.slider.setSingleStep(self._step)
+        layout.addWidget(self.slider, 1)
+
+        # 先设值，再连信号，避免构造期就回灌一次
+        self._value = self._clamp(value)
+        self.slider.setValue(self._value)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+
+    def entry_id(self):
+        return self._entry_id
+
+    def value(self):
+        return self._value
+
+    def set_on_change(self, callback):
+        self._on_change = callback
+
+    def set_value(self, value, notify=True):
+        value = self._clamp(value)
+        if value == self._value:
+            return
+        self._value = value
+        was_blocked = self.slider.blockSignals(True)
+        try:
+            self.slider.setValue(value)
+        finally:
+            self.slider.blockSignals(was_blocked)
+        if notify and self._on_change is not None:
+            self._on_change(value)
+
+    def set_connected(self, connected):
+        self._connected = bool(connected)
+        self.slider.setEnabled(self._connected)
+        if self._connected:
+            self._dim_effect = None
+            self.setGraphicsEffect(None)
+        else:
+            self._dim_effect = QGraphicsOpacityEffect(self)
+            self._dim_effect.setOpacity(self.DISCONNECTED_OPACITY)
+            self.setGraphicsEffect(self._dim_effect)
+
+    def _clamp(self, value):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = self._min
+        return max(self._min, min(self._max, value))
+
+    def _on_slider_changed(self, value):
+        # 不做步长吸附、不回灌 setValue：手柄跟手，值就是鼠标指到的那个
+        self._value = self._clamp(value)
+        if self._on_change is not None:
+            self._on_change(self._value)
+
+
+class TraySliderCard(RoundMenu):
+    """悬停数值型托盘条目时从菜单右侧弹出的圆角浮条：图标 + 名称 + 滑杆。
+
+    为什么套一层 :class:`RoundMenu` 而不是自起一个浮窗：托盘菜单是 Qt 的
+    ``Popup``，而**点击嵌套 Popup 只会收掉更上层的那一个**（子菜单正是这么
+    工作的）。``Qt.Tool`` 那类独立窗口对 Popup 而言是「外部点击」，一点就把
+    整个菜单关掉 —— 旧实现正是栽在这里，才不得不把滑杆塞进子菜单，还为
+    item 的 36px 缩进硬留 CLIPPED_RIGHT 补偿。
+
+    走 ``addMenu`` 还顺带拿到 hover 探测、400ms 防抖、右侧定位与屏幕翻边、
+    行尾 ``›`` 箭头。视觉上要的「独立圆角卡片」靠三件事达成：item 的 16px
+    缩进归零（QSS ``MenuActionListWidget::item`` 的 padding+margin）、换成
+    不绘制悬停底色的 item delegate、清掉 view 自带的上下 6px 留白。
+    """
+
+    RADIUS = 10
+    # 指针离开本行到落到卡片之间有一小段真空（含定位留的 5px 间隙），这段时间
+    # 不能立刻收起，否则浮条会闪一下又弹回来
+    HIDE_GRACE_MS = 140
+
+    def __init__(self, icon, label, minimum, maximum, value, on_change=None,
+                 step=None, entry_id="", parent=None):
+        super().__init__(title=f"{label}   {value}", parent=parent)
+        self._label = label
+        self._min = int(minimum)
+        self._max = int(maximum)
+        self._entry_id = str(entry_id)
+        self._on_change = on_change
+        self._row_width = None
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(self.HIDE_GRACE_MS)
+        self._hide_timer.timeout.connect(self._hide_after_grace)
+
+        self.view.setObjectName("traySliderCardView")
+        self.view.setItemDelegate(QStyledItemDelegate(self.view))
+        self.view.setViewportMargins(0, 0, 0, 0)
+        self._apply_card_style()
+
+        # 圆角卡片本体由 view 绘制，阴影挂在 view 上所以跟着圆角走。
+        # 用库默认参数（blur 30 / offset (0,8) / alpha 30）—— 托盘菜单本身
+        # 就是这么画的，自己调重了会比菜单突兀一圈
+        self.setShadowEffect()
+        # 左 12 不能省：MenuAnimationManager._endPosition 会用
+        # contentsMargins().left() 回抵，去掉它卡片会整体左偏 12px
+        self.hBoxLayout.setContentsMargins(12, 8, 12, 12)
+
+        self.row = TraySliderRow(
+            icon, label, minimum, maximum, value,
+            on_change=self._on_row_changed, step=step, entry_id=entry_id,
+        )
+        self.addWidget(self.row, selectable=False)
+
+    # ── 对外 ────────────────────────────────────────────────────
+
+    def set_on_change(self, callback):
+        self._on_change = callback
+
+    def set_connected(self, connected):
+        self.row.set_connected(connected)
+
+    def value(self):
+        return self.row.value()
+
+    def sync_row_text(self, value):
+        """把数值同步到父菜单那一行条目上（「背光   50」）。"""
+        self.set_menu_row_text(f"{self._label}   {value}")
+
+    def show_by_click(self):
+        """点菜单行时展开浮条 —— 悬停之外的第二个入口。
+
+        直接复用库自己的 ``_onShowMenuTimeOut``：它已经算好了「行右侧 +5、
+        屏幕上放不下就翻到左侧」的定位并走 ``exec``，抄一遍只会走样。
+        先把 ``lastHover*`` 指到本行、并停掉悬停的防抖定时器，免得 400ms 后
+        又被弹一次。
+        """
+        parent = self.parentMenu
+        if parent is None or self.menuItem is None:
+            return
+        parent.timer.stop()
+        parent.lastHoverItem = self.menuItem
+        parent.lastHoverSubMenuItem = self.menuItem
+        parent._onShowMenuTimeOut()
+
+    def set_menu_row_text(self, text):
+        """改父菜单行的文字，并把行宽预留到**取值范围内最宽**的那一档。
+
+        行宽一次预留到位，拖动时 9 → 99 → 100 只换文字不重排，菜单不会抖。
+        宽度公式对齐库的 ``_createSubMenuItem``：有图标时标题前要补一个空格
+        且系数是 72，无图标时是 60。
+        """
+        item = self.menuItem
+        parent = self.parentMenu
+        if item is None or parent is None:
+            return
+
+        original = item.text()
+        prefix = original[: len(original) - len(original.lstrip())]
+        item.setText(prefix + text)
+
+        width = self._row_width_for(parent.view.fontMetrics(), prefix)
+        size = QSize(width, parent.itemHeight)
+        if self._row_width == width and item.sizeHint() == size:
+            return
+        self._row_width = width
+        item.setSizeHint(size)
+        parent.view.adjustSize()
+        parent.adjustSize()
+
+    def _row_width_for(self, font_metrics, prefix):
+        """行宽按取值范围内**实际最宽**的一档算。
+
+        不能假定某个数字最宽：比例字体下 1 往往比 8 窄，用 ``"0"*位数`` 当
+        最坏情况会在 99→100 时被裁。这里把端点值和一串最宽候选都量一遍取最大。
+        """
+        digits = len(str(self._max))
+        candidates = {str(self._min), str(self._max), "8" * digits, "0" * digits}
+        widest = max(
+            candidates,
+            key=lambda value: font_metrics.boundingRect(f"{self._label}   {value}").width(),
+        )
+        return font_metrics.boundingRect(
+            prefix + f"{self._label}   {widest}"
+        ).width() + (72 if prefix else 60)
+
+    # ── 菜单联动 ────────────────────────────────────────────────
+
+    def _on_row_changed(self, value):
+        self.sync_row_text(value)
+        if self._on_change is not None:
+            self._on_change(self._entry_id, value)
+
+    def exec(self, pos, ani=True, aniType=MenuAnimationType.DROP_DOWN):
+        """弹出。必须走基类 exec，别自己 ``move(pos)``。
+
+        ``MenuAnimationManager._endPosition`` 会做一次
+        ``pos.x() - contentsMargins().left()`` 回抵，让**卡片左缘**落在
+        ``_onShowMenuTimeOut`` 算出的那个位置上；自己 move 就丢了这层补偿，
+        卡片会左偏 12px。``ani`` 形参库里其实没被真正使用，决定动画的是
+        ``aniType``，所以这里显式传 NONE。
+        """
+        return super().exec(pos, aniType=MenuAnimationType.NONE)
+
+    def mousePressEvent(self, event):
+        """一律吞掉。
+
+        卡片只承载滑杆，本身没有「点一下就选中」的语义。基类在这里对 view
+        之外的点击会 ``_hideMenu(True)``，再经 ``hideEvent``
+        （``isHideBySystem`` 为真且 ``isSubMenu``）**级联关掉父菜单** ——
+        而那种点击往往只是落在圆角外那圈阴影留白上。
+        """
+        return
+
+    def enterEvent(self, event):
+        self._hide_timer.stop()
+        super().enterEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """指针离开本行、又还没落到卡片上时，**不要立刻收起**。
+
+        基类（``RoundMenu.mouseMoveEvent``）的判定是「在父菜单里、但不在本行、
+        也不在卡片上就收」。可从菜单移到卡片**必然**要穿过这么一段（行外那几
+        像素 + 定位留的 5px 间隙），于是浮条会在穿越的瞬间闪没、约 400ms 后又
+        弹回来 —— 就是「鼠标放上去会抖」。这里给一小段宽限：落到卡片上、或指针
+        回到本行，就取消；真的移到别的行上才收。
+        """
+        pos = event.globalPosition().toPoint()
+        if self._point_on_card(pos) or self._point_on_own_row(pos):
+            self._hide_timer.stop()
+            return
+        self._hide_timer.start()
+
+    def _hide_after_grace(self):
+        pos = QCursor.pos()
+        if self._point_on_card(pos) or self._point_on_own_row(pos):
+            return
+        self._hideMenu(False)
+
+    def _point_on_card(self, global_pos):
+        return QRect(self.mapToGlobal(QPoint(0, 0)), self.size()).contains(global_pos)
+
+    def _point_on_own_row(self, global_pos):
+        item, parent = self.menuItem, self.parentMenu
+        if item is None or parent is None:
+            return False
+        view = parent.view
+        margin = view.viewportMargins()
+        rect = view.visualItemRect(item).translated(view.mapToGlobal(QPoint()))
+        rect = rect.translated(margin.left(), margin.top() + 2)
+        return rect.contains(global_pos)
+
+    def sizeHint(self):
+        # _onShowMenuTimeOut 用 sizeHint() 判断屏幕放不放得下（放不下会把卡片
+        # 翻到左侧），而 adjustSize() 只 setFixedSize，QWidget.sizeHint() 仍
+        # 是布局那套值、和实际尺寸对不上。这里如实回报。
+        return self.size()
+
+    def _apply_card_style(self):
+        if isDarkTheme():
+            background, border = "rgba(20, 20, 20, 215)", "rgba(255, 255, 255, 45)"
+        else:
+            background, border = "rgba(255, 255, 255, 245)", "rgba(0, 0, 0, 22)"
+        # ::item 那段是必须的：库给 MenuActionListWidget::item 留了 16px 缩进
+        # （padding 10 + margin 6），不清掉整行内容会右移、尾部被裁。
+        # ID 选择器的特异性高于类型选择器，压得过库自带的规则。
+        self.view.setStyleSheet(f"""
+            MenuActionListWidget#traySliderCardView {{
+                background-color: {background};
+                border: 1px solid {border};
+                border-radius: {self.RADIUS}px;
+            }}
+            MenuActionListWidget#traySliderCardView::item {{
+                background: transparent;
+                border: none;
+                padding: 0px;
+                margin: 0px;
+            }}
+        """)
+
+
+class TrayOptionMenu(CheckableMenu):
+    """取值型条目的勾选子菜单。行为与原先一致，只强制无弹出动画。
+
+    库里 ``exec`` 的 ``ani`` 形参没被真正使用，必须传 ``aniType=NONE`` 才
+    不播 ``DROP_DOWN`` 那套自上而下擦入 + ``setMask`` 的动画。
+    """
+
+    def exec(self, pos, ani=True, aniType=MenuAnimationType.DROP_DOWN):
+        return super().exec(pos, aniType=MenuAnimationType.NONE)
+
+
+class TrayMenu(SystemTrayMenu):
+    """托盘右键主菜单。相对 ``SystemTrayMenu`` 只加一处：点到数值型条目时
+    也把它的浮条展开。
+
+    库的 ``RoundMenu._onItemClicked`` 对子菜单行是直接 return 的（它取的
+    ``item.data(UserRole)`` 是 RoundMenu 而不是 QAction，`action not in
+    self._actions` 就返回了），所以子菜单历来只靠悬停打开、点击什么都不做。
+    这里补上点击入口，**并且不能走 ``super()``** —— 普通条目的点击路径会
+    ``_closeParentMenu()``，那样菜单连同浮条一起没了。
+    """
+
+    def _onItemClicked(self, item):
+        menu = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(menu, TraySliderCard):
+            menu.show_by_click()
+            return
+        super()._onItemClicked(item)
+
+
+TRAY_ROW_HEIGHT = 38
+
+
+class TrayRowDelegate(QStyledItemDelegate):
+    """「已加入」列表的行绘制与按钮命中判定。
+
+    行内容全部自绘（列表里是纯 item，不用 item widget）：
+        ⠿  条目名                      ▲ ▼ ✕
+
+    为什么不用 item widget：控件会吞掉鼠标事件（拖动起不来），而给控件设
+    ``WA_TransparentForMouseEvents`` 又会连带屏蔽它自己的子控件（✕ 点不动）。
+
+    按钮矩形由 :meth:`row_action_rects` 统一给出，绘制与命中判定共用同一份，
+    保证「画在哪就能点哪」（高 DPI 缩放下尤其重要）。
+    """
+
+    ACTION_WIDTH = 28
+    ACTION_GAP = 2
+    EDGE_PADDING = 8
+    GLYPH_WIDTH = 16
+    TEXT_LEFT_PADDING = 12
+    TEXT_RIGHT_GAP = 8
+    TEXT_FONT_SIZE = 14  # 与 BodyLabel 一致
+
+    def __init__(self, list_widget):
+        super().__init__(list_widget)
+        self._list = list_widget
+        self._hover_row = -1
+        self._hover_action = None
+
+    # ── 几何 ────────────────────────────────────────────────
+    def row_action_rects(self, item_rect):
+        """返回 (▲, ▼, ✕) 三个按钮矩形，从右往左排布。"""
+        size = min(self.ACTION_WIDTH, item_rect.height())
+        top = item_rect.top() + (item_rect.height() - size) // 2
+        right = item_rect.right() - self.EDGE_PADDING
+
+        close_rect = QRect(right - size, top, size, size)
+        right = close_rect.left() - self.ACTION_GAP
+        down_rect = QRect(right - size, top, size, size)
+        right = down_rect.left() - self.ACTION_GAP
+        up_rect = QRect(right - size, top, size, size)
+        return up_rect, down_rect, close_rect
+
+    def hit_action(self, item_rect, pos):
+        """坐标落在哪个按钮上，返回 "up"/"down"/"close"/None。"""
+        up_rect, down_rect, close_rect = self.row_action_rects(item_rect)
+        if close_rect.contains(pos):
+            return "close"
+        if up_rect.contains(pos):
+            return "up"
+        if down_rect.contains(pos):
+            return "down"
+        return None
+
+    def set_hover(self, row, action):
+        previous = (self._hover_row, self._hover_action)
+        self._hover_row, self._hover_action = row, action
+        return previous != (row, action)
+
+    # ── 绘制 ────────────────────────────────────────────────
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 拖动预览是把被拖项画进一张未裁剪的位图，必须自己裁剪，
+        # 否则相邻行的内容会糊在一起
+        painter.setClipRect(option.rect)
+
+        rect = option.rect
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if hovered or selected:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 24 if selected else 14))
+            painter.drawRoundedRect(rect.adjusted(2, 2, -2, -2), 6, 6)
+
+        row = index.row()
+        last_row = index.model().rowCount() - 1
+
+        # 图标必须画在正方形里：drawIcon 按给定矩形拉伸 svg，
+        # 给非方形矩形（比如整行高度）会把图标拉成细长条
+        glyph = QRect(
+            rect.left() + self.TEXT_LEFT_PADDING,
+            rect.top() + (rect.height() - self.GLYPH_WIDTH) // 2,
+            self.GLYPH_WIDTH,
+            self.GLYPH_WIDTH,
+        )
+        painter.setOpacity(0.55)
+        drawIcon(FIF.MOVE, painter, glyph, theme=Theme.AUTO)
+        painter.setOpacity(1.0)
+
+        up_rect, down_rect, close_rect = self.row_action_rects(rect)
+        for action, action_rect, icon, disabled in (
+            ("up", up_rect, FIF.UP, row == 0),
+            ("down", down_rect, FIF.DOWN, row == last_row),
+            ("close", close_rect, FIF.CLOSE, False),
+        ):
+            if disabled:
+                painter.setOpacity(0.25)
+            elif self._hover_row == row and self._hover_action == action:
+                painter.setOpacity(1.0)
+            else:
+                painter.setOpacity(0.7)
+            # 命中区 28px，图标内缩画 16px，视觉上不至于挤满
+            icon_rect = action_rect.adjusted(
+                (action_rect.width() - self.GLYPH_WIDTH) // 2,
+                (action_rect.height() - self.GLYPH_WIDTH) // 2,
+                -(action_rect.width() - self.GLYPH_WIDTH) // 2,
+                -(action_rect.height() - self.GLYPH_WIDTH) // 2,
+            )
+            drawIcon(icon, painter, icon_rect, theme=Theme.AUTO)
+            painter.setOpacity(1.0)
+
+        text_left = glyph.right() + self.TEXT_RIGHT_GAP
+        text_rect = QRect(text_left, rect.top(), max(0, up_rect.left() - text_left - self.TEXT_RIGHT_GAP), rect.height())
+        # 与 BodyLabel 同字号：列表默认字体比页面其它文字小一号
+        painter.setFont(getFont(self.TEXT_FONT_SIZE))
+        painter.setPen(QColor(255, 255, 255) if option.state & QStyle.StateFlag.State_Enabled else QColor(255, 255, 255, 120))
+        painter.drawText(
+            text_rect,
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+        )
+        painter.restore()
+
+    # ── 交互：只在「松手」时判定 ──────────────────────────────
+    def editorEvent(self, event, model, option, index):
+        if event.type() != QEvent.Type.MouseButtonRelease:
+            return False
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if self._list.is_drag_in_progress():
+            return False
+
+        action = self.hit_action(option.rect, event.position().toPoint())
+        if action is None:
+            return False
+
+        entry_id = index.data(Qt.ItemDataRole.UserRole)
+        if not entry_id:
+            return False
+        # 必须是同一次按下开始的操作（防「按在空白处、松手落在按钮上」误触）
+        if self._list.pressed_entry_id() != entry_id:
+            return False
+        # 首行不能再上移、末行不能再下移
+        if action == "up" and index.row() == 0:
+            return False
+        if action == "down" and index.row() >= model.rowCount() - 1:
+            return False
+
+        # 不在视图的事件处理栈里改模型，推迟到事件循环下一轮
+        if action == "close":
+            QTimer.singleShot(0, lambda: self._list.request_remove(entry_id))
+        else:
+            direction = -1 if action == "up" else 1
+            QTimer.singleShot(0, lambda: self._list.request_move(entry_id, direction))
+        return True
+
+
+class TrayItemList(QListWidget):
+    """托盘「已加入」列表：纯 item + 委托绘制，支持拖动排序与行内按钮。
+
+    与默认行为不同的三点：
+    1. 必须允许选中 —— Qt 只在「按下的项成为选中项」时才进入拖动状态，
+       用 NoSelection 会完全拖不动。
+    2. 悬停状态要显式开启 —— 委托靠 ``State_MouseOver`` 画悬停底色，
+       而该状态默认不投递（从前是靠样式表里的 ``:hover`` 顺带打开的）。
+    3. 拖动的落盘时机 —— 内部拖动只发 ``rowsInserted``/``rowsRemoved``，
+       **不发 ``rowsMoved``**；所以在 ``startDrag`` 的 ``super()`` 返回后
+       （此时 Qt 已完成 clearOrRemove）再通知外部保存顺序。
+    """
+
+    remove_requested = pyqtSignal(str)
+    move_requested = pyqtSignal(str, int)
+    reorder_finished = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setUniformItemSizes(True)
+        self.setMouseTracking(True)
+        self.setStyleSheet("QListWidget { background: transparent; border: none; }")
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.viewport().setMouseTracking(True)
+
+        self.delegate = TrayRowDelegate(self)
+        self.setItemDelegate(self.delegate)
+        self._drag_in_progress = False
+        self._pressed_entry_id = None
+
+    # ── 拖动 ────────────────────────────────────────────────
+    def is_drag_in_progress(self):
+        return self._drag_in_progress
+
+    def startDrag(self, supported_actions):
+        self._drag_in_progress = True
+        try:
+            super().startDrag(supported_actions)
+        finally:
+            self._drag_in_progress = False
+            self._apply_row_heights()
+            self.reorder_finished.emit()
+
+    def _apply_row_heights(self):
+        """放下时 Qt 会按 mime 数据新建 item，sizeHint 未必带过来，这里补齐。"""
+        for index in range(self.count()):
+            item = self.item(index)
+            if item.sizeHint().height() != self.delegate_row_height():
+                item.setSizeHint(QSize(0, self.delegate_row_height()))
+
+    def delegate_row_height(self):
+        return TRAY_ROW_HEIGHT
+
+    # ── 鼠标：记录按下项，供委托做同项校验 ────────────────────
+    def pressed_entry_id(self):
+        return self._pressed_entry_id
+
+    def mousePressEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        self._pressed_entry_id = index.data(Qt.ItemDataRole.UserRole) if index.isValid() else None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        index = self.indexAt(event.position().toPoint())
+        action = None
+        if index.isValid():
+            action = self.delegate.hit_action(self.visualRect(index), event.position().toPoint())
+        row = index.row() if index.isValid() else -1
+        if self.delegate.set_hover(row, action):
+            self.viewport().update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        if self.delegate.set_hover(-1, None):
+            self.viewport().update()
+        super().leaveEvent(event)
+
+    # ── 供委托调用 ──────────────────────────────────────────
+    def request_remove(self, entry_id):
+        self.remove_requested.emit(str(entry_id))
+
+    def request_move(self, entry_id, direction):
+        self.move_requested.emit(str(entry_id), int(direction))
+
+
+class CountdownBar(QWidget):
+    """快捷键「松手后生效」的倒计时进度条。
+
+    由 QPropertyAnimation 驱动（而不是逐帧定时器写值），动画本身走 Qt 的
+    插值，不需要外部时钟，也不会因为主线程忙而丢帧。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(5)
+        self._progress = 1.0
+        self._anim = QPropertyAnimation(self, b"progress", self)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.0)
+        self._anim.setEasingCurve(QEasingCurve.Type.Linear)
+
+    def get_progress(self):
+        return self._progress
+
+    def set_progress(self, value):
+        self._progress = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    progress = pyqtProperty(float, fget=get_progress, fset=set_progress)
+
+    def start(self, duration_ms):
+        self._anim.stop()
+        self._anim.setDuration(max(1, int(duration_ms)))
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.0)
+        self.set_progress(1.0)
+        self._anim.start()
+
+    def stop(self):
+        self._anim.stop()
+        self.set_progress(0.0)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        radius = self.height() / 2
+        track = QColor(255, 255, 255, 40)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track)
+        painter.drawRoundedRect(self.rect(), radius, radius)
+
+        width = int(self.width() * self._progress)
+        if width <= 0:
+            return
+        painter.setBrush(QColor("#0078d4"))
+        painter.drawRoundedRect(0, 0, width, self.height(), radius, radius)
+
+
 class OsdHud(QWidget):
     def __init__(self, parent=None):
         super().__init__(None) # Independent floating window!
@@ -88,6 +769,11 @@ class OsdHud(QWidget):
         self.val_lbl.setStyleSheet("color: #0078d4; font-size: 20px; font-weight: 900; font-family: 'Segoe UI', 'Microsoft YaHei'; background: transparent;")
         self.val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.val_lbl)
+
+        # 倒计时进度条：只在「松手后生效」等待期间显示
+        self.countdown_bar = CountdownBar(self.frame)
+        self.countdown_bar.setVisible(False)
+        layout.addWidget(self.countdown_bar)
         
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -97,9 +783,16 @@ class OsdHud(QWidget):
         self.anim = QPropertyAnimation(self, b"windowOpacity")
         self.anim.setDuration(250)
         
-    def show_hud(self, title, val):
+    def show_hud(self, title, val, countdown=None):
+        """显示悬浮提示。countdown 为等待秒数时显示进度条。"""
         self.title_lbl.setText(title)
         self.val_lbl.setText(val)
+        if countdown and countdown > 0:
+            self.countdown_bar.setVisible(True)
+            self.countdown_bar.start(int(countdown * 1000))
+        else:
+            self.countdown_bar.setVisible(False)
+            self.countdown_bar.stop()
         self.frame.setGeometry(0, 0, self._hud_size.width(), self._hud_size.height())
         
         # Center bottom of primary screen
@@ -124,9 +817,15 @@ class OsdHud(QWidget):
                 pass
         QTimer.singleShot(0, self.raise_)
         
-        # Show on screen for 1.8 seconds
-        self.timer.start(1800)
+        # 有倒计时时至少覆盖整个等待时间，否则进度条还没走完提示就先淡出了
+        stay_ms = 1800 if not countdown else max(1800, int(countdown * 1000) + 600)
+        self.timer.start(stay_ms)
         
+    def end_countdown(self):
+        """倒计时结束（值已下发）：收起进度条。"""
+        self.countdown_bar.stop()
+        self.countdown_bar.setVisible(False)
+
     def hide_smooth(self):
         self.anim.stop()
         try:

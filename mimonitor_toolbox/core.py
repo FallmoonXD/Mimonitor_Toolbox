@@ -20,7 +20,17 @@ def get_app_data_dir():
     return folder
 
 def get_settings_path():
-    """获取跨平台、无需管理员权限的软件配置保存路径"""
+    """获取跨平台、无需管理员权限的软件配置保存路径。
+
+    ``MIMONITOR_SETTINGS_PATH`` 可覆盖（与 ADB_SERVER_PORT 同样用环境变量
+    覆盖的写法）：测试用它把配置写到临时目录，避免碰到用户真实配置。
+    """
+    override = os.environ.get("MIMONITOR_SETTINGS_PATH")
+    if override:
+        folder = os.path.dirname(override)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        return override
     folder = get_app_data_dir()
     return os.path.join(folder, "config.json")
 
@@ -40,6 +50,9 @@ def _load_settings_unlocked():
         "freesync_previous_mode": None,
         "crosshair_game_mode_only": True,
         "crosshair_memory": None,
+        "tray_items": ["picture_mode", "local_dimming", "backlight"],
+        "hotkey_countdown_enabled": True,
+        "hotkey_countdown_seconds": 0.8,
     }
     path = get_settings_path()
     data = {}

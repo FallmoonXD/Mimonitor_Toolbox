@@ -2,11 +2,58 @@ import os
 import unittest
 from unittest import mock
 
+import _isolation  # noqa: F401  配置隔离：见 tests/_isolation.py
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QPoint, QSize, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractButton, QApplication
 
+
 _qt_application = QApplication.instance() or QApplication([])
+
+
+class TrayTestBase(unittest.TestCase):
+    """托盘相关测试的公共基类。
+
+    用户名下的真实配置必须隔离：App() 构造时会读配置，任何一条没被 mock 到的
+    写入路径都可能污染它（本项目已经踩过一次）。把配置路径指向临时文件后，
+    无论调用方 import 的是哪个模块的 update_settings 都写不进真实配置。
+    """
+
+    def _app(self):
+        from mimonitor_toolbox.main_window import App
+
+        with mock.patch.object(App, "register_global_hotkeys"), \
+                mock.patch.object(App, "setup_tray"):
+            return App()
+
+    def _tray_page_app(self):
+        """构造 App 并让托盘页拿到真实几何：列表的行内按钮命中区是从右边缘
+        算出来的，控件没被布局撑开时按钮会挤到左边，点击坐标就全错了。"""
+        window = self._app()
+        window.resize(1100, 820)
+        window.stackedWidget.setCurrentWidget(window.tray_page)
+        window.show()
+        _qt_application.processEvents()
+        return window
+
+    def _close(self, window):
+        window._cleanup_done = True
+        window.hide()
+        window.deleteLater()
+        _qt_application.processEvents()
+
+    def _settings_patches(self, settings):
+        """同时 patch 两个模块的读写：load 在 main_window，写在各处。"""
+        from mimonitor_toolbox import main_window as mw
+        from mimonitor_toolbox import pages as pages_module
+
+        return (
+            mock.patch.object(mw, "load_settings", side_effect=lambda: dict(settings)),
+            mock.patch.object(pages_module, "update_settings", side_effect=settings.update),
+        )
 
 
 class PageContractTests(unittest.TestCase):
@@ -178,6 +225,478 @@ class PageContractTests(unittest.TestCase):
         window._cleanup_done = True
         window.deleteLater()
         _qt_application.processEvents()
+
+
+class TrayMenuTests(TrayTestBase):
+    """托盘右键菜单：目录、取值联动、菜单结构与左右键分流。"""
+
+    def _patch_tray_items(self, items):
+        from mimonitor_toolbox import main_window as mw
+
+        return mock.patch.object(
+            mw, "load_settings", return_value={"tray_items": list(items)}
+        )
+
+    def test_catalog_covers_options_and_steppers(self):
+        window = self._app()
+        catalog = {e["id"]: e for e in window.tray_entry_catalog()}
+
+        self.assertEqual(catalog["picture_mode"]["kind"], "options")
+        self.assertEqual(catalog["picture_mode"]["label"], "画面模式")
+        self.assertIn((14, "标准"), catalog["picture_mode"]["options"])
+        self.assertEqual(catalog["backlight"]["kind"], "stepper")
+        self.assertEqual(catalog["backlight"]["max"], 100)
+        self._close(window)
+
+    def test_entry_value_reads_current_values(self):
+        window = self._app()
+        window.current_vals.update({"picture_mode": 10, "picture_backlight": 42})
+
+        self.assertEqual(window.tray_entry_value("picture_mode"), 10)
+        self.assertEqual(window.tray_entry_value("backlight"), 42)
+        self.assertIsNone(window.tray_entry_value("color_space"))
+        self.assertIsNone(window.tray_entry_value("does_not_exist"))
+        self._close(window)
+
+    def test_apply_option_invokes_matching_executor(self):
+        window = self._app()
+        window.adb_connected = True
+        with mock.patch.object(window, "_set_mode") as set_mode:
+            window.tray_apply_option("picture_mode", 10)
+
+        set_mode.assert_called_once_with(10, "游戏")
+        self._close(window)
+
+    def test_set_value_clamps_and_uses_debounce_path(self):
+        window = self._app()
+        window.adb_connected = True
+        with mock.patch.object(window, "_stage_adjustable_display_value") as stage:
+            window.tray_set_value("backlight", 45)
+            window.tray_set_value("backlight", 999)
+        self.assertEqual([c.args[2] for c in stage.call_args_list], [45, 100])
+
+        with mock.patch.object(window, "_stage_adjustable_display_value") as stage2:
+            window.adb_connected = False
+            window.tray_set_value("backlight", 45)
+        stage2.assert_not_called()
+        self._close(window)
+
+    def test_menu_entries_and_numeric_float_card(self):
+        """取值型是勾选子菜单；数值型悬停弹独立圆角浮条，数值留在条目文字里。"""
+        from mimonitor_toolbox.widgets import TrayOptionMenu, TraySliderCard
+
+        window = self._app()
+        window.status_label.setText("已连接")
+        window.current_vals.update({"picture_mode": 10, "picture_backlight": 42})
+
+        with self._patch_tray_items(["picture_mode", "backlight"]):
+            menu = window.build_tray_menu()
+
+        actions = menu.menuActions()
+        self.assertEqual(actions[0].text(), "已连接")
+        self.assertFalse(actions[0].isEnabled())
+        self.assertIn("显示主窗口", [a.text() for a in actions])
+        self.assertIn("退出程序", [a.text() for a in actions])
+
+        submenus = menu._subMenus
+        self.assertEqual(
+            [m.title().strip() for m in submenus], ["画面模式", "背光   42"]
+        )
+        self.assertIsInstance(submenus[0], TrayOptionMenu)
+        self.assertIsInstance(submenus[1], TraySliderCard)
+
+        # 取值型：打勾列表
+        option_items = submenus[0].menuActions()
+        self.assertEqual([a.text() for a in option_items], ["标准", "游戏", "电影"])
+        self.assertTrue(next(a for a in option_items if a.text() == "游戏").isChecked())
+
+        # 数值型：一张浮条卡片，数值显示在父菜单那一行上
+        card = submenus[1]
+        self.assertEqual(card.view.count(), 1)
+        self.assertIs(card.view.itemWidget(card.view.item(0)), card.row)
+        self.assertEqual(card.row.value(), 42)
+        self.assertEqual(card.row.slider.value(), 42)
+        self.assertEqual(card.menuItem.text().strip(), "背光   42")
+
+        with mock.patch.object(window, "tray_set_value") as set_value:
+            card.row.slider.setValue(51)  # 背光 min=1 step=5，51 在网格上
+        set_value.assert_called_once_with("backlight", 51)
+        self.assertEqual(card.menuItem.text().strip(), "背光   51",
+                         "拖动时数值要实时跟到托盘那一行")
+        self._close(window)
+
+    def test_点击数值条目也能展开浮条(self):
+        """悬停之外再给一个明确入口：点这一行也把浮条弹出来。
+
+        普通条目点击会关掉整条菜单，数值条目不该跟着关 —— 浮条是挂在菜单这个
+        Popup 链上的，菜单没了浮条也没了。
+        """
+        from mimonitor_toolbox.widgets import TrayMenu, TraySliderCard
+
+        window = self._app()
+        window.status_label.setText("已连接")
+        window.adb_connected = True
+        window.current_vals.update({"picture_backlight": 42})
+
+        with self._patch_tray_items(["backlight"]):
+            menu = window.build_tray_menu()
+
+        self.assertIsInstance(menu, TrayMenu)
+        card = menu._subMenus[0]
+        self.assertIsInstance(card, TraySliderCard)
+
+        # _onShowMenuTimeOut 会先看父菜单是不是隐藏着，先让它真的显示出来
+        menu.show()
+        _qt_application.processEvents()
+        try:
+            with mock.patch.object(TraySliderCard, "exec") as card_exec, \
+                    mock.patch.object(menu, "_hideMenu") as hide_menu:
+                menu._onItemClicked(card.menuItem)
+
+            card_exec.assert_called_once()
+            hide_menu.assert_not_called()
+            self.assertIs(menu.lastHoverSubMenuItem, card.menuItem)
+            self.assertFalse(menu.timer.isActive(), "点击后不该再等悬停的 400ms")
+        finally:
+            menu.close()
+            menu.deleteLater()
+            _qt_application.processEvents()
+        self._close(window)
+
+    def test_点击普通条目仍走原路径(self):
+        """只有数值条目被接管；状态行这种普通条目要保持库的原有行为。"""
+        from mimonitor_toolbox.widgets import TrayMenu
+
+        window = self._app()
+        window.status_label.setText("已连接")
+
+        with self._patch_tray_items(["backlight"]):
+            menu = window.build_tray_menu()
+
+        self.assertIsInstance(menu, TrayMenu)
+        status_item = menu.view.item(0)
+        # patch 真正实现它的 RoundMenu，而不是 MRO 中间的 SystemTrayMenu：
+        # 后者并没有定义这个方法，patch 退出时会往它身上塞一个残留属性
+        from qfluentwidgets import RoundMenu
+
+        with mock.patch.object(RoundMenu, "_onItemClicked") as parent_click:
+            menu._onItemClicked(status_item)
+        parent_click.assert_called_once_with(status_item)
+        self._close(window)
+
+    def test_empty_configuration_shows_hint(self):
+        window = self._app()
+        with self._patch_tray_items([]):
+            menu = window.build_tray_menu()
+
+        texts = [a.text() for a in menu.menuActions()]
+        self.assertTrue(any("添加快捷项" in t for t in texts))
+        self.assertEqual(menu._subMenus, [])
+        self._close(window)
+
+    def test_context_click_opens_menu_and_left_click_toggles_window(self):
+        from PyQt6.QtWidgets import QSystemTrayIcon
+
+        window = self._app()
+        with mock.patch.object(window, "popup_tray_menu") as popup:
+            window.on_tray_activated(QSystemTrayIcon.ActivationReason.Context)
+        popup.assert_called_once()
+
+        with mock.patch.object(window, "show_and_raise") as show, \
+                mock.patch.object(window, "isVisible", return_value=False):
+            window.on_tray_activated(QSystemTrayIcon.ActivationReason.Trigger)
+        show.assert_called_once()
+        self._close(window)
+
+    def test_customization_add_remove_and_move(self):
+        window = self._app()
+        settings = {"tray_items": ["picture_mode", "backlight"]}
+        with self._settings_patches(settings)[0], self._settings_patches(settings)[1]:
+            window._tray_add_item("color_space")
+            self.assertEqual(
+                settings["tray_items"], ["picture_mode", "backlight", "color_space"]
+            )
+
+            window._tray_move_item("color_space", -1)
+            self.assertEqual(
+                settings["tray_items"], ["picture_mode", "color_space", "backlight"]
+            )
+
+            window._tray_remove_item("picture_mode")
+            self.assertEqual(settings["tray_items"], ["color_space", "backlight"])
+
+            window._tray_move_item("color_space", -1)  # 已在首位，不变
+            self.assertEqual(settings["tray_items"], ["color_space", "backlight"])
+        self._close(window)
+
+
+class TrayPageTests(TrayTestBase):
+    """托盘菜单页：纯 item 列表 + 委托绘制 + 行内 ▲▼✕。"""
+
+    def _prepare_list(self, widget, width=460):
+        """给列表一个真实宽度：命中区是从右边缘往左算的，控件过窄时三个按钮
+        会挤到左边，连"点文字区"都会落进按钮里（测试里踩过）。"""
+        widget.setFixedWidth(width)
+        _qt_application.processEvents()
+
+    def _click_zone(self, widget, row, zone):
+        """按委托绘制用的同一份矩形，取该行某按钮的中心点（视口坐标）。"""
+        self._prepare_list(widget)
+        rect = widget.visualRect(widget.model().index(row, 0))
+        up_rect, down_rect, close_rect = widget.delegate.row_action_rects(rect)
+        target = {"up": up_rect, "down": down_rect, "close": close_rect}[zone]
+        return target.center()
+
+    def test_customization_lives_on_its_own_page(self):
+        window = self._tray_page_app()
+
+        self.assertEqual(window.tray_page.objectName(), "trayPage")
+        self.assertTrue(window.tray_page.isAncestorOf(window.tray_enabled_list))
+        for widget in (window.tray_enabled_list, window.tray_empty_hint):
+            self.assertFalse(window.tools_page.isAncestorOf(widget))
+        self.assertEqual(
+            [window.tray_enabled_list.item(i).data(Qt.ItemDataRole.UserRole)
+             for i in range(window.tray_enabled_list.count())],
+            ["picture_mode", "local_dimming", "backlight"],
+        )
+        self._close(window)
+
+    def test_enabled_list_has_no_item_widgets(self):
+        """必须纯 item：行控件会吞鼠标事件（拖不动），而给控件设透传又会
+        连带屏蔽子控件（✕ 点不动）——这是上一版的两个 bug 的根因。"""
+        window = self._tray_page_app()
+        widget = window.tray_enabled_list
+
+        self.assertGreater(widget.count(), 0)
+        for index in range(widget.count()):
+            self.assertIsNone(widget.itemWidget(widget.item(index)))
+        self._close(window)
+
+    def test_drag_prerequisites_are_enabled(self):
+        from PyQt6.QtWidgets import QAbstractItemView
+
+        window = self._tray_page_app()
+        widget = window.tray_enabled_list
+
+        self.assertEqual(
+            widget.selectionMode(), QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.assertTrue(widget.dragEnabled())
+        self.assertEqual(
+            widget.dragDropMode(), QAbstractItemView.DragDropMode.InternalMove
+        )
+        self.assertEqual(widget.defaultDropAction(), Qt.DropAction.MoveAction)
+        # 委托靠 State_MouseOver 画悬停底色，而它默认不投递，必须显式开
+        self.assertTrue(widget.viewport().testAttribute(Qt.WidgetAttribute.WA_Hover))
+        self.assertTrue(widget.viewport().hasMouseTracking())
+        self._close(window)
+
+    def _standalone_list(self):
+        """独立列表：测试里主窗口内的托盘页拿不到可见几何（视口恒为 100），
+        命中区是从右边缘算的，控件没撑开就全挤在左边，点击坐标全错。
+        独立窗口下的几何是真实的，因此点击路径在这里测。"""
+        from PyQt6.QtWidgets import QListWidgetItem
+
+        from mimonitor_toolbox.widgets import TRAY_ROW_HEIGHT, TrayItemList
+
+        widget = TrayItemList()
+        widget.resize(460, 200)
+        for entry_id, label in (
+            ("picture_mode", "画面模式"),
+            ("local_dimming", "精密控光"),
+            ("backlight", "背光"),
+        ):
+            item = QListWidgetItem(label, widget)
+            item.setSizeHint(QSize(0, TRAY_ROW_HEIGHT))
+            item.setData(Qt.ItemDataRole.UserRole, entry_id)
+            widget.addItem(item)
+        widget.show()
+        _qt_application.processEvents()
+        return widget
+
+    def _dispose(self, widget):
+        widget.hide()
+        widget.deleteLater()
+        _qt_application.processEvents()
+
+    def test_clicking_close_emits_remove_request(self):
+        widget = self._standalone_list()
+        received = []
+        widget.remove_requested.connect(received.append)
+
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, self._click_zone(widget, 1, "close"),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(received, ["local_dimming"])
+        self._dispose(widget)
+
+    def test_clicking_up_and_down_emit_move_requests(self):
+        widget = self._standalone_list()
+        received = []
+        widget.move_requested.connect(lambda eid, d: received.append((eid, d)))
+
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, self._click_zone(widget, 1, "up"),
+        )
+        _qt_application.processEvents()
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, self._click_zone(widget, 1, "down"),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(received, [("local_dimming", -1), ("local_dimming", 1)])
+        self._dispose(widget)
+
+    def test_first_row_up_and_last_row_down_emit_nothing(self):
+        widget = self._standalone_list()
+        received = []
+        widget.move_requested.connect(lambda eid, d: received.append((eid, d)))
+
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, self._click_zone(widget, 0, "up"),
+        )
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, self._click_zone(widget, 2, "down"),
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(received, [])
+        self._dispose(widget)
+
+    def test_clicking_row_body_emits_nothing(self):
+        """点文字区不应误触（防命中区过贪）。"""
+        widget = self._standalone_list()
+        self._prepare_list(widget)
+        received = []
+        widget.remove_requested.connect(received.append)
+        widget.move_requested.connect(lambda eid, d: received.append((eid, d)))
+
+        rect = widget.visualRect(widget.model().index(1, 0))
+        body_pos = QPoint(rect.left() + 12, rect.center().y())
+        QTest.mouseClick(
+            widget.viewport(), Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, body_pos,
+        )
+        _qt_application.processEvents()
+
+        self.assertEqual(received, [])
+        self._dispose(widget)
+
+    def test_page_reacts_to_list_signals(self):
+        """页面把列表信号接到增删改上，并且改动会落盘。"""
+        window = self._app()
+        settings = {"tray_items": ["picture_mode", "local_dimming", "backlight"]}
+        widget = window.tray_enabled_list
+
+        with self._settings_patches(settings)[0], self._settings_patches(settings)[1]:
+            widget.remove_requested.emit("local_dimming")
+            self.assertEqual(settings["tray_items"], ["picture_mode", "backlight"])
+
+            widget.move_requested.emit("backlight", -1)
+            self.assertEqual(settings["tray_items"], ["backlight", "picture_mode"])
+
+            widget.reorder_finished.emit()
+            self.assertEqual(settings["tray_items"], ["backlight", "picture_mode"])
+        self._close(window)
+
+    def test_hit_zones_are_exact_and_disjoint(self):
+        from PyQt6.QtCore import QRect
+
+        from mimonitor_toolbox.widgets import TrayItemList
+
+        widget = TrayItemList()
+        widget.resize(360, 120)
+        delegate = widget.delegate
+        item_rect = QRect(0, 0, 360, 38)
+        up_rect, down_rect, close_rect = delegate.row_action_rects(item_rect)
+
+        self.assertEqual(delegate.hit_action(item_rect, close_rect.center()), "close")
+        self.assertEqual(delegate.hit_action(item_rect, up_rect.center()), "up")
+        self.assertEqual(delegate.hit_action(item_rect, down_rect.center()), "down")
+        self.assertFalse(up_rect.intersects(down_rect))
+        self.assertFalse(down_rect.intersects(close_rect))
+        self.assertIsNone(delegate.hit_action(item_rect, QPoint(60, 19)))
+        widget.deleteLater()
+        _qt_application.processEvents()
+
+    def test_reorder_persists_after_drag(self):
+        """内部拖动不发 rowsMoved，落盘必须挂在 startDrag 之后。"""
+        from mimonitor_toolbox.widgets import TrayItemList
+
+        window = self._tray_page_app()
+        settings = {"tray_items": ["picture_mode", "local_dimming", "backlight"]}
+        widget = window.tray_enabled_list
+
+        with self._settings_patches(settings)[0], self._settings_patches(settings)[1]:
+            # 桩掉 super().startDrag：真拖动在 offscreen 下会阻塞在嵌套事件循环
+            with mock.patch.object(
+                TrayItemList, "startDrag", autospec=True, side_effect=lambda self, actions: None
+            ):
+                widget.startDrag(Qt.DropAction.MoveAction)
+            # 模拟拖动结果：首项挪到末尾
+            widget.addItem(widget.takeItem(0))
+            widget.reorder_finished.emit()
+            _qt_application.processEvents()
+
+        self.assertEqual(
+            settings["tray_items"], ["local_dimming", "backlight", "picture_mode"]
+        )
+        self._close(window)
+
+    def test_available_switches_are_not_rebuilt(self):
+        """「可添加」控件只建一次：重建会重置开关动画、让鼠标下的控件消失
+        （拖动时下方开关抽搐的观感来源之一）。"""
+        window = self._tray_page_app()
+        before = {k: id(v) for k, v in window._tray_switches.items()}
+
+        settings = {"tray_items": ["picture_mode", "local_dimming", "backlight"]}
+        with self._settings_patches(settings)[0], self._settings_patches(settings)[1]:
+            window._tray_move_item("backlight", -1)
+            window._tray_remove_item("local_dimming")
+            window._tray_add_item("color_space")
+
+        after = {k: id(v) for k, v in window._tray_switches.items()}
+        self.assertEqual(before, after, "开关控件被重建了")
+        self._close(window)
+
+    def test_switches_track_enabled_items(self):
+        window = self._app()
+        settings = {"tray_items": ["picture_mode", "backlight"]}
+
+        with self._settings_patches(settings)[0]:
+            window._tray_sync_switches()
+
+        self.assertTrue(window._tray_switches["picture_mode"].isChecked())
+        self.assertTrue(window._tray_switches["backlight"].isChecked())
+        self.assertFalse(window._tray_switches["color_space"].isChecked())
+        self._close(window)
+
+    def test_enabled_list_height_is_capped(self):
+        """条目多时封顶并允许内部滚动，避免卡片无限长。"""
+        from mimonitor_toolbox import pages as pages_module
+        from mimonitor_toolbox import main_window as mw
+
+        window = self._app()
+        widget = window.tray_enabled_list
+        many = ["picture_mode", "local_dimming", "backlight", "color_space",
+                "color_temp", "response_time", "freesync", "input_source",
+                "black_level", "contrast"]
+
+        with mock.patch.object(mw, "load_settings", return_value={"tray_items": many}):
+            window._tray_sync_enabled()
+
+        self.assertEqual(widget.height(), pages_module.TRAY_VISIBLE_ROWS * 38)
+        self.assertNotEqual(
+            widget.verticalScrollBarPolicy(), Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._close(window)
 
 
 if __name__ == "__main__":

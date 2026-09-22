@@ -104,7 +104,8 @@ service call TvService 3 s16 "sh -c eval\${IFS}CLASSPATH=...\${IFS}MtkDirectTool
 - 信号源切换（HDMI 1/2 / DP / USBC）
 - 屏幕灯：炫彩灯模式 / 亮度挡位 / 纯色颜色 / 照明色温
 - 虚拟遥控器
-- 全局快捷键（Windows）+ OSD 悬浮通知
+- 全局快捷键（Windows）+ OSD 悬浮通知（松手后生效，带倒计时进度条）
+- 托盘快捷菜单：右键托盘图标弹出 Fluent 菜单，条目可自定义；取值型是打勾子菜单，数值型悬停或点击即从旁边弹出圆角浮条（图标 + 名称 + 滑杆），拖动时数值实时同步回菜单行，左键单击仍是显示/隐藏窗口
 - 开机自启动最小化
 - 4K UI 模式（3840×2160 / DPI 640，需重启显示器）
 - ADB 保活守护部署与状态检测（内置 `assets/adb_guardian/adbguardian-signed.apk`）

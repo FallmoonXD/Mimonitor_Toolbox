@@ -174,5 +174,121 @@ class CrosshairModeReconcileTests(unittest.TestCase):
         )
 
 
+class HotkeyCountdownTests(unittest.TestCase):
+    """快捷键「松手后生效」的等待时长与悬浮提示倒计时条。"""
+
+    def _host(self, settings, osd=None):
+        from PyQt6.QtCore import QObject
+
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class Host(DisplayFeaturesMixin, QObject):
+            def __init__(self):
+                super().__init__()
+                self.current_vals = {}
+                self._cycle_hotkey_pending = {}
+                self._cycle_hotkey_timers = {}
+                self._adjust_hotkey_pending = {}
+                self._adjust_hotkey_timers = {}
+                self.osd = osd
+                self.logs = []
+                self.values_signal = mock.Mock()
+
+            def log(self, message):
+                self.logs.append(message)
+
+            def _highlight_mode(self, _value):
+                pass
+
+        return Host()
+
+    def _delay(self, settings):
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        class Host(DisplayFeaturesMixin):
+            pass
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)):
+            return Host().effective_hotkey_delay()
+
+    def test_delay_follows_settings(self):
+        self.assertAlmostEqual(
+            self._delay({"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.8}), 0.8
+        )
+        self.assertAlmostEqual(
+            self._delay({"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.0}), 0.1
+        )
+        self.assertEqual(
+            self._delay({"hotkey_countdown_enabled": False, "hotkey_countdown_seconds": 0.8}), 0.0
+        )
+        self.assertAlmostEqual(self._delay({}), 0.8)
+
+    def test_staging_shows_countdown_and_waits(self):
+        from mimonitor_toolbox import display_features
+
+        osd = mock.Mock()
+        host = self._host({}, osd=osd)
+        settings = {"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.8}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_commit_cycle_hotkey_action") as commit:
+            host._stage_cycle_hotkey_action(
+                "picture_mode_cycle", "picture_mode",
+                [(14, "标准"), (10, "游戏")], "画面模式", lambda v, n: None,
+            )
+            timer = host._cycle_hotkey_timers["picture_mode_cycle"]
+
+        osd.show_hud.assert_called_once_with("画面模式", "游戏", countdown=0.8)
+        self.assertTrue(timer.isActive())
+        self.assertEqual(timer.interval(), 800)
+        commit.assert_not_called()
+
+    def test_disabled_countdown_applies_immediately(self):
+        from mimonitor_toolbox import display_features
+
+        osd = mock.Mock()
+        host = self._host({}, osd=osd)
+        settings = {"hotkey_countdown_enabled": False}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_commit_cycle_hotkey_action") as commit:
+            host._stage_cycle_hotkey_action(
+                "picture_mode_cycle", "picture_mode",
+                [(14, "标准"), (10, "游戏")], "画面模式", lambda v, n: None,
+            )
+            timer = host._cycle_hotkey_timers["picture_mode_cycle"]
+
+        # 不带进度条，且立即提交
+        osd.show_hud.assert_called_once_with("画面模式", "游戏", countdown=None)
+        commit.assert_called_once_with("picture_mode_cycle")
+        self.assertFalse(timer.isActive())
+
+    def test_tray_slider_does_not_pop_hud(self):
+        """托盘菜单里已内联显示数值，滑块调整不应再弹悬浮窗。"""
+        from mimonitor_toolbox import display_features
+
+        osd = mock.Mock()
+        host = self._host({}, osd=osd)
+        settings = {"hotkey_countdown_enabled": True, "hotkey_countdown_seconds": 0.8}
+        cfg = {"label": "背光", "setting": "picture_backlight", "min": 1, "max": 100}
+
+        with mock.patch.object(display_features, "load_settings", side_effect=lambda: dict(settings)), \
+                mock.patch.object(host, "_set_adjustable_display_value"):
+            host._stage_adjustable_display_value("backlight", cfg, 45, show_hud=False)
+
+        osd.show_hud.assert_not_called()
+        self.assertIn("backlight", host._adjust_hotkey_pending)
+
+    def test_commit_ends_countdown_bar(self):
+        osd = mock.Mock()
+        host = self._host({}, osd=osd)
+        host._cycle_hotkey_pending["x"] = None
+
+        host._commit_cycle_hotkey_action("x")
+
+        osd.end_countdown.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

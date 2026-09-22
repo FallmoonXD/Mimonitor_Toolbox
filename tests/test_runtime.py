@@ -1,3 +1,4 @@
+import _isolation  # noqa: F401  配置隔离：见 tests/_isolation.py
 import ctypes
 import ctypes.wintypes
 import json
