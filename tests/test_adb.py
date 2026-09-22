@@ -105,9 +105,12 @@ __MIMONITOR_BATCH_END__
                     True,
                 ),
                 (
-                    "service call TvService 3 s16 \"cp "
-                    "/sdcard/ColorfulLedTool.jar "
-                    "/data/data/mitv.service/cache/ColorfulLedTool.jar\"",
+                    # 必须走 sh -c eval + ${IFS}：runSystemCommand 是
+                    # Runtime.exec(String)，按空白切分且不起 shell，
+                    # 用真实空格会让 sh -c 只拿到被截断的第一个词而静默失败。
+                    "service call TvService 3 s16 \"sh -c eval\\${IFS}cp"
+                    "\\${IFS}/sdcard/ColorfulLedTool.jar"
+                    "\\${IFS}/data/data/mitv.service/cache/ColorfulLedTool.jar\"",
                     True,
                 ),
             ],

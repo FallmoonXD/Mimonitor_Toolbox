@@ -504,6 +504,10 @@ final class AppState: ObservableObject {
         if let raw = values["g_video__vid_od_response_time"], let v = Int(raw) {
             values["picture_response_time"] = String(v)
         }
+        // 自动调整亮度（光感）：菜单读的是 MTK 侧，覆盖 settings 值
+        if let raw = values["g_video__light_sensor_switch"], let v = Int(raw) {
+            values["tv_picture_light_sensor"] = String(v)
+        }
         // 背光滑条同样以 JNI 为准
         if let raw = values["g_disp__disp_back_light"], let v = Int(raw) {
             values["picture_backlight"] = String(v)
@@ -726,6 +730,36 @@ final class AppState: ObservableObject {
             self.adb.settingsPut("picture_local_dimming", String(value))
             self.adb.settingsPut("tv_picture_video_local_dimming", String(value))
             self.adb.refreshPq()
+        }
+    }
+
+    /// 自动调整亮度（光感）开关。
+    ///
+    /// 这个开关有**两份状态**，必须都写：`tv_picture_light_sensor` 是
+    /// MiBackLightManager 真正监听的（功能立即生效），MTK 的
+    /// `g_video__light_sensor_switch` 才是设置菜单显示的值。只写前者功能会生效，
+    /// 但菜单显示不同步。
+    ///
+    /// 注意这只是**结果状态等价**，不是过程等价：照抄的是某一次拨动的写入快照，
+    /// 没有走 App 层的 setLightSensor() 判断，也不触发菜单的埋点上报。
+    ///
+    /// 菜单手拨「开」还会顺带写三个 DBC（动态背光）的值；本机未启用那套功能
+    /// （没有 mitv.settings.backlight.dbc 功能位），写入效果**未经验证**，故不写。
+    ///
+    /// 两处偏离本模块其他 JNI 写入的惯例，都是有意的：`upd` 传 1（其余处用默认的
+    /// 3），这是实测手拨菜单抓到的值；不跟 `refreshPq()`，光感由 ContentObserver
+    /// 立即生效，菜单路径里没有这一步。
+    func setLightSensor(_ on: Bool) {
+        guard isConnected else { return log("未连接") }
+        let value = on ? 1 : 0
+        currentValues["tv_picture_light_sensor"] = String(value)
+        log("自动调整亮度: \(on ? "开" : "关")")
+        runBackground {
+            // settings put 必须由 adb shell 执行（shell 持有 WRITE_SECURE_SETTINGS）；
+            // 塞进 service call TvService 会被 tvservice 的 uid 静默拒绝 —— 所以这两条
+            // 是两次独立调用，不要"优化"成一条 TvService 命令。
+            self.adb.jniSet(key: "g_video__light_sensor_switch", value: String(value), upd: 1)
+            self.adb.settingsPut("tv_picture_light_sensor", String(value))
         }
     }
 
@@ -1598,6 +1632,7 @@ final class AppState: ObservableObject {
         case "hdr_tone_mapping":    return intValue("settings_display_hdr_color_tone", default: -1)
         case "source":              return intValue("mitv.tvplayer.hdmi.last.source", default: -1)
         case "freesync":            return intValue("freesync", default: -1)
+        case "light_sensor":        return intValue("tv_picture_light_sensor", default: -1)
         case "backlight":           return intValue("picture_backlight", default: -1)
         case "black_level":         return intValue("picture_brightness", default: -1)
         case "contrast":            return intValue("picture_contrast", default: -1)
@@ -1621,6 +1656,7 @@ final class AppState: ObservableObject {
         case "hdr_tone_mapping":    setHdrToneMapping(value)
         case "source":              setSource(value)
         case "freesync":            setFreesync(value == 1)
+        case "light_sensor":        setLightSensor(value == 1)
         case "light_mode":          setLightMode(value)
         default: break
         }

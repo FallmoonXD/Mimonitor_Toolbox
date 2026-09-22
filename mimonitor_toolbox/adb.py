@@ -102,6 +102,22 @@ def build_tvservice_app_process_command(jar, args):
     )
 
 
+def build_tvservice_shell_command(parts):
+    """构造一条经 TvService 执行的外部命令（`sh -c eval` + `${IFS}` 分隔）。
+
+    TvService 的 runSystemCommand 直接调 `Runtime.exec(String)`，而它按空白
+    切分、**不起 shell**。所以命令体里的空格必须写成字面量 `${IFS}`：`sh` 会
+    把它展开回空白，再交给 `eval` 重新解析。
+
+    写成"真实空格 + 转义双引号"的老形式会静默失败 —— `sh -c` 只拿到被截断的
+    第一个词（如 `"cp`），而 `service call` 依旧返回 Parcel，看着像成功。
+    同理，如果没有 `sh -c` 这层而直接写 `cp A B`，虽然 argv 恰好正确，但没有
+    实测背书，不要回退到那种写法。
+    """
+    encoded = "".join(f"\\${{IFS}}{part}" for part in parts)
+    return f'service call TvService 3 s16 "sh -c eval{encoded}"'
+
+
 def parse_jni_batch_output(output):
     values = {}
     for line in str(output or "").splitlines():
@@ -342,7 +358,7 @@ class Adb:
                     _adb_log(f"WARNING: {filename} 本地未找到，无法推送到设备")
                     return False
             self.shell(
-                f'service call TvService 3 s16 "cp {sdcard_jar} {cache_jar}"',
+                build_tvservice_shell_command(["cp", sdcard_jar, cache_jar]),
                 check=check,
             )
             return True

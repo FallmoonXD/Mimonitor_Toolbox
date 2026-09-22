@@ -280,6 +280,13 @@ class PagesMixin:
 
         h.addWidget(self.picture_mode_hint_label)
         h.addStretch(1)
+        # 自动调整亮度（光感）：开关控件放这一行，状态由 MTK 侧读数同步
+        h.addWidget(BodyLabel("自动调整亮度", lf))
+        self.light_sensor_switch = SwitchButton(lf)
+        self.light_sensor_switch.setOnText("开")
+        self.light_sensor_switch.setOffText("关")
+        self.light_sensor_switch.checkedChanged.connect(self._set_light_sensor)
+        h.addWidget(self.light_sensor_switch)
         lf_layout.addLayout(h)
         layout.addWidget(lf)
 

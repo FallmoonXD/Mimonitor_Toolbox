@@ -135,12 +135,12 @@ class DeviceFeaturesMixin:
                     "tv_picture_video_local_dimming", "picture_hdr_tone_mapping",
                     "settings_display_hdr_color_tone", "picture_dynamic_definition",
                     "picture_response_time", "tv_picture_advanced_video_color_space",
-                    "tv_picture_video_color_space",
+                    "tv_picture_video_color_space", "tv_picture_light_sensor",
                 ],
                 "jni": [
                     "g_disp__disp_back_light", "g_video__vid_gamut_mapping_mode",
                     "g_video__clr_temp", "g_video__vid_local_dimming",
-                    "g_video__vid_hdr_tone_mapping_mode",
+                    "g_video__vid_hdr_tone_mapping_mode", "g_video__light_sensor_switch",
                 ],
             },
             "gamePage": {
@@ -1292,7 +1292,10 @@ class DeviceFeaturesMixin:
                     self._highlight_btn(btn, str(active_val) == str(val))
                 if key == "picture_color_temperature":
                     self._update_color_gain_visibility(active_val)
-                        
+
+        if "tv_picture_light_sensor" in vals:
+            self._sync_light_sensor_switch(str(vals["tv_picture_light_sensor"]).strip() == "1")
+
         if "picture_preset_scenario" in vals:
             self._highlight_mode(vals["picture_preset_scenario"])
         elif "picture_mode" in vals:
@@ -1417,6 +1420,14 @@ class DeviceFeaturesMixin:
                             dim_val = int(jni_batch_vals["g_video__vid_local_dimming"])
                             settings_vals["picture_local_dimming"] = dim_val
                             settings_vals["tv_picture_video_local_dimming"] = dim_val
+                        except (TypeError, ValueError): pass
+
+                    # 读取 JNI 光感开关 (菜单读的是 MTK 侧，覆盖 settings 值)
+                    if "g_video__light_sensor_switch" in jni_batch_vals:
+                        try:
+                            settings_vals["tv_picture_light_sensor"] = int(
+                                jni_batch_vals["g_video__light_sensor_switch"]
+                            )
                         except (TypeError, ValueError): pass
 
                     # HDR 色调映射的 OSD 索引与 MTK 底层枚举不同。

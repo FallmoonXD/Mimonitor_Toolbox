@@ -60,6 +60,10 @@ enum MenuBarCatalog {
             Option(label: "关", value: 0),
             Option(label: "开", value: 1),
         ])),
+        MenuBarEntry(id: "light_sensor", label: "自动调整亮度", kind: .options([
+            Option(label: "关", value: 0),
+            Option(label: "开", value: 1),
+        ])),
         MenuBarEntry(id: "backlight", label: "背光", kind: .stepper(min: 1, max: 100, step: 5)),
         MenuBarEntry(id: "black_level", label: "黑色级别", kind: .stepper(min: 0, max: 100, step: 5)),
         MenuBarEntry(id: "contrast", label: "对比度", kind: .stepper(min: 0, max: 100, step: 5)),

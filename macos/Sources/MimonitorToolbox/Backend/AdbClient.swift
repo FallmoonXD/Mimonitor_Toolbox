@@ -335,6 +335,19 @@ final class AdbClient {
         return "service call TvService 3 s16 \"sh -c eval\\${IFS}CLASSPATH=\(jar)\\${IFS}/system/bin/app_process\\${IFS}/data/data/mitv.service/cache\(encoded)\""
     }
 
+    /// 构造一条经 TvService 执行的外部命令（`sh -c eval` + `${IFS}` 分隔），移植自 adb.py。
+    ///
+    /// TvService 的 runSystemCommand 直接调 `Runtime.exec(String)`，按空白切分且
+    /// **不起 shell**。所以命令体里的空格必须写成字面量 `${IFS}`：`sh` 会把它展开回
+    /// 空白，再交给 `eval` 重新解析。
+    ///
+    /// 写成"真实空格 + 转义双引号"的老形式会静默失败 —— `sh -c` 只拿到被截断的第一个
+    /// 词（如 `"cp`），而 `service call` 依旧返回 Parcel，看着像成功。
+    func buildTvserviceShellCommand(parts: [String]) -> String {
+        let encoded = parts.map { "\\${IFS}\($0)" }.joined()
+        return "service call TvService 3 s16 \"sh -c eval\(encoded)\""
+    }
+
     func jniSet(key: String, value: String, upd: Int = 3) {
         let jar = "/data/data/mitv.service/cache/MtkDirectTool.jar"
         shell(buildTvserviceCommand(jar: jar, args: ["MtkDirectTool", "set", key, value, String(upd)]))
@@ -400,6 +413,6 @@ final class AdbClient {
         if sdSize < 1000 || (localSize > 0 && sdSize != localSize) {
             run(["-s", serial, "push", local, sdcardJar], timeout: 30)
         }
-        shell("service call TvService 3 s16 \"cp \(sdcardJar) \(cacheJar)\"")
+        shell(buildTvserviceShellCommand(parts: ["cp", sdcardJar, cacheJar]))
     }
 }

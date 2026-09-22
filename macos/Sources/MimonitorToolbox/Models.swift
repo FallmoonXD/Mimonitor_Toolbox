@@ -103,7 +103,7 @@ enum PageDataKeys {
         "tv_picture_video_local_dimming", "picture_hdr_tone_mapping",
         "settings_display_hdr_color_tone", "picture_dynamic_definition",
         "picture_response_time", "tv_picture_advanced_video_color_space",
-        "tv_picture_video_color_space",
+        "tv_picture_video_color_space", "tv_picture_light_sensor",
     ]
     static let pictureJni = [
         "g_disp__disp_back_light", "g_video__vid_gamut_mapping_mode",
@@ -111,6 +111,8 @@ enum PageDataKeys {
         "g_video__vid_hdr_tone_mapping_mode",
         // 原版通过 query_setting_or_jni 单独读它；放进同一批里一起拿更省一次往返
         "g_video__vid_od_response_time",
+        // 自动调整亮度（光感）：菜单读的是 MTK 侧，回读后覆盖 settings 值
+        "g_video__light_sensor_switch",
     ]
     static let gameSettings = [
         "picture_mode", "picture_preset_scenario", "front_sight_index",

@@ -20,6 +20,12 @@ struct PictureView: View {
                         Button("恢复默认") { state.resetCurrentMode() }
                         Text(state.pictureModeHint).font(.callout).foregroundColor(.secondary)
                         Spacer()
+                        // 自动调整亮度（光感）：状态以 MTK 侧回读为准（见 applyJniOverrides）
+                        Toggle("自动调整亮度", isOn: Binding(
+                            get: { state.intValue("tv_picture_light_sensor", default: 0) == 1 },
+                            set: { state.setLightSensor($0) }
+                        ))
+                        .toggleStyle(.switch)
                     }
                 }
 
