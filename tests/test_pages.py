@@ -210,6 +210,7 @@ class PageContractTests(unittest.TestCase):
         })
 
         self.assertEqual(window.picture_mode_hint_label.text(), "当前场景：Dolby Vision 自定义")
+        self.assertIn("FluentLabelBase", window.picture_mode_hint_label.styleSheet())
         self.assertTrue(all(not button.isChecked() for button in window.mode_btns.values()))
         self.assertFalse(window.hdr_tone_mapping_card.isHidden())
         window._cleanup_done = True

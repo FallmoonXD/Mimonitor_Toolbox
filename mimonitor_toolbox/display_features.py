@@ -5,7 +5,7 @@ import time
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
-from qfluentwidgets import BodyLabel, MessageBox, ToggleButton
+from qfluentwidgets import BodyLabel, FluentStyleSheet, MessageBox, ToggleButton
 
 from .adb import async_run
 from .core import (
@@ -1733,13 +1733,13 @@ class DisplayFeaturesMixin:
         group_name = self._picture_mode_group_name(mode_int)
         if group_name:
             label.setText(f"当前场景：{group_name}（{mode_int}）")
-            label.setStyleSheet("font-size: 12px;")
+            FluentStyleSheet.LABEL.apply(label)
             return
 
         scene_name = PICTURE_SCENE_NAMES.get(mode_int)
         if scene_name:
             label.setText(f"当前场景：{scene_name}")
-            label.setStyleSheet("font-size: 12px;")
+            FluentStyleSheet.LABEL.apply(label)
         else:
             label.setText(f"当前场景：未知场景（{mode_int}），不匹配上方模式按钮")
             label.setStyleSheet("color: #f0b85a; font-size: 12px;")
