@@ -1059,6 +1059,35 @@ class PresetAndTaskPageTests(TrayTestBase):
         self.assertEqual(settings["presets"], [])
         self.assertEqual(len(self._cards(window)), 2)        # 无预设 + 添加
 
+    def test_deleting_active_preset_returns_to_baseline(self):
+        """删当前预设：立即解禁两个「记忆」，但不能丢掉「退回无预设」的撤销点。
+
+        删预设不会改设备，此刻设备还停在被删预设的那套值上；快照是"套预设之前"
+        那份值，是用户唯一的退路，所以必须留着。
+        """
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"presets": [{"id": "p1", "name": "A", "values": {}}],
+                    "active_preset_id": "p1",
+                    "preset_snapshot": {"source": "A", "values": {"picture_mode": 9}}}
+        window = self._window(settings)
+        applied = []
+
+        def fake_apply(values, label, before_apply=None, on_finished=None, quiet=False):
+            applied.append(values)
+            if on_finished is not None:
+                on_finished(True)
+
+        window._apply_picture_values = fake_apply
+        with mock.patch.object(pages_module, "MessageBox") as box:
+            box.return_value.exec.return_value = True
+            window._preset_delete("p1")
+        self.assertIsNone(settings["active_preset_id"])
+        self.assertTrue(window.chk_hdr_local_dimming_memory.isEnabled())
+        self.assertTrue(window.has_preset_snapshot())
+        window._preset_restore_baseline()
+        self.assertEqual(applied, [{"picture_mode": 9}])
+
     def test_cancelled_delete_keeps_the_preset(self):
         from mimonitor_toolbox import pages as pages_module
 
