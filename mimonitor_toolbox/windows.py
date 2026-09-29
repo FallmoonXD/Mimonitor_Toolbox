@@ -22,9 +22,11 @@ MOD_WIN = 0x0008
 
 DXGI_ERROR_NOT_FOUND = 0x887A0002
 DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 = 12
-MONITOR_DEFAULTTONEAREST = 2
 DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x00000001
 EDD_GET_DEVICE_INTERFACE_NAME = 0x00000001
+# 小米系显示器的 EDID PNP 厂商码（XMI3009 = 2026 款 G Pro 27U，XMI27B3 = 2025 款）。
+# 只匹配厂商码、不锁具体型号：型号串随年头变，写死会让新机型多屏时识别不到。
+HDR_TARGET_VENDOR_PREFIX = "XMI"
 
 
 class _GUID(ctypes.Structure):
@@ -146,6 +148,7 @@ def list_windows_displays():
     enum_devices.argtypes = [wt.LPCWSTR, wt.DWORD, ctypes.POINTER(_DISPLAY_DEVICEW), wt.DWORD]
     enum_devices.restype = wt.BOOL
     displays = []
+    slot_occurrence = {}
     adapter_index = 0
     while True:
         adapter = _DISPLAY_DEVICEW()
@@ -167,53 +170,94 @@ def list_windows_displays():
                 display_name = adapter.DeviceName.rsplit("\\", 1)[-1]
                 display_number = display_name.removeprefix("DISPLAY")
                 slot_label = f"屏幕 {display_number}" if display_number.isdigit() else display_name
+                # 槽位名来自适配器（\\.\DISPLAY1 -> 屏幕 1），而一个适配器下可能挂多台
+                # monitor（MST 菊花链、虚拟屏），只用适配器名会出两条一模一样的
+                # "屏幕 1"。第二台起补个序号，保证下拉里能区分。
+                slot_occurrence[slot_label] = slot_occurrence.get(slot_label, 0) + 1
+                if slot_occurrence[slot_label] > 1:
+                    slot_label = f"{slot_label}-{slot_occurrence[slot_label]}"
                 displays.append({
                     "device_name": adapter.DeviceName,
                     "device_id": monitor.DeviceID,
-                    "label": f"{monitor.DeviceString or '显示器'} · {slot_label}",
+                    "label": _display_label(monitor.DeviceString, monitor.DeviceID, slot_label),
                 })
     return displays
 
 
+def display_product_code(device_id):
+    """从设备接口名里取 EDID 产品码：``\\\\?\\DISPLAY#XMI3009#5&...`` -> ``XMI3009``。
+
+    "屏幕 N" 只是 Windows 的显示槽位名，换接口就会变；两台都报
+    "Generic PnP Monitor" 时，只有这个产品码能把它们分开。
+    """
+    parts = str(device_id or "").split("#")
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+# 系统给的占位名，装了通用驱动的显示器都长这样，写进下拉只是噪声（还带本地化变体）
+_GENERIC_MONITOR_NAMES = {
+    "generic pnp monitor",
+    "generic monitor",
+    "generic non-pnp monitor",
+    "default monitor",
+    "通用即插即用监视器",
+    "通用非即插即用监视器",
+    "显示器",
+}
+
+
+def _display_label(device_string, device_id, slot_label):
+    """下拉项与「目标屏：」用的文案：型号（如果是真名） · 产品码 · 屏幕 N。
+
+    三样都可能缺：占位名丢掉、产品码解析不到就不写，但屏幕槽位一定在。
+    """
+    name = str(device_string or "").strip()
+    parts = []
+    if name and name.lower() not in _GENERIC_MONITOR_NAMES:
+        parts.append(name)
+    code = display_product_code(device_id)
+    if code:
+        parts.append(code)
+    parts.append(slot_label)
+    return " · ".join(parts)
+
+
 def resolve_hdr_target_display(displays, configured_id=None):
-    """Never substitute another screen when a configured target disappears."""
+    """挑出要读 HDR 状态的那块屏；拿不准时返回 None，绝不退而求其次选别的屏。"""
     if configured_id:
         return next((item for item in displays if item["device_id"] == configured_id), None)
-    matches = [item for item in displays if "XMI27B3" in item["device_id"].upper()]
+    # 按厂商码而不是具体型号匹配：作者在 2025 款（XMI27B3）上验证，2026 款是
+    # XMI3009 —— 写死型号会让新机型在多屏时识别不到，联动静默暂停。
+    matches = [item for item in displays
+               if HDR_TARGET_VENDOR_PREFIX in item["device_id"].upper()]
     if len(matches) == 1:
         return matches[0]
     return displays[0] if len(displays) == 1 else None
 
 
-def _select_hdr_output_state(outputs, target_device_name=None, target_monitor=None):
+def _select_hdr_output_state(outputs, target_device_name=None):
+    r"""按 GDI 名字（``\\.\DISPLAY1``）挑那块屏的 HDR 状态。
+
+    指定了名字却找不到就返回 None —— 不退回"任意一块开着 HDR 的屏"，那正是原来的 bug。
+    """
     if target_device_name:
-        return next((hdr for name, monitor, hdr in outputs
-                     if name == target_device_name), None)
-    if target_monitor:
-        return next((hdr for name, monitor, hdr in outputs
-                     if monitor == target_monitor), None)
-    return any(hdr for name, monitor, hdr in outputs) if outputs else None
+        return next((hdr for name, hdr in outputs if name == target_device_name), None)
+    return any(hdr for name, hdr in outputs) if outputs else None
 
 
-def query_windows_hdr_enabled(window_handle=None, *, target_device_id=None):
-    """Return True/False for the active Windows HDR color space, or None when unavailable."""
+def query_windows_hdr_enabled(*, target_device_name=None):
+    """Return True/False for the active Windows HDR color space, or None when unavailable.
+
+    ``target_device_name`` 是要查的那块屏的 GDI 名字（``\\.\\DISPLAY1``），由调用方从
+    上一次枚举结果里带过来 —— 本函数**自己不再枚举显示器**：它每 3 秒被轮询一次，
+    再枚举一遍纯属浪费（而且原来的 ``window_handle``／``target_device_id`` 版本正是
+    因为内部重新解析，才会在双屏下出现选错屏、多枚举一次这些问题）。
+
+    不传名字时退回"任意一块开着 HDR 的屏"，仅供无目标场景的测试/兜底使用。
+    """
     if sys.platform != "win32":
         return None
     try:
-        target_monitor = None
-        target_device_name = None
-        if target_device_id:
-            target = resolve_hdr_target_display(list_windows_displays(), target_device_id)
-            if target is None:
-                return None
-            target_device_name = target["device_name"]
-        if not target_device_name and window_handle and user32:
-            target_monitor = user32.MonitorFromWindow(wt.HWND(int(window_handle)), MONITOR_DEFAULTTONEAREST)
-            try:
-                target_monitor = int(target_monitor or 0)
-            except Exception:
-                target_monitor = None
-
         dxgi = ctypes.WinDLL("dxgi")
         create_factory = dxgi.CreateDXGIFactory1
         create_factory.argtypes = [_GUID_POINTER, _VOID_POINTER_POINTER]
@@ -267,11 +311,7 @@ def query_windows_hdr_enabled(window_handle=None, *, target_device_id=None):
                                     )
                                     if get_desc1(output6, ctypes.byref(desc)) == 0 and desc.AttachedToDesktop:
                                         is_hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                                        try:
-                                            monitor = int(desc.Monitor or 0)
-                                        except Exception:
-                                            monitor = None
-                                        attached_outputs.append((desc.DeviceName, monitor, is_hdr))
+                                        attached_outputs.append((desc.DeviceName, is_hdr))
                                 finally:
                                     _release_com(output6)
                         finally:
@@ -283,7 +323,7 @@ def query_windows_hdr_enabled(window_handle=None, *, target_device_id=None):
         finally:
             _release_com(factory)
 
-        return _select_hdr_output_state(attached_outputs, target_device_name, target_monitor)
+        return _select_hdr_output_state(attached_outputs, target_device_name)
     except Exception:
         return None
 

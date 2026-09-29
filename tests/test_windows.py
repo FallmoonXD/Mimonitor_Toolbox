@@ -44,13 +44,13 @@ class WindowsRuntimeTests(unittest.TestCase):
         from mimonitor_toolbox import windows
 
         outputs = [
-            (r"\\.\DISPLAY1", 101, False),
-            (r"\\.\DISPLAY2", 202, True),
+            (r"\\.\DISPLAY1", False),
+            (r"\\.\DISPLAY2", True),
         ]
         self.assertFalse(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY1"))
         self.assertTrue(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY2"))
+        # 指定了却找不到就返回 None，不退回"任意一块开着 HDR 的屏"
         self.assertIsNone(windows._select_hdr_output_state(outputs, r"\\.\DISPLAY3"))
-        self.assertIsNone(windows._select_hdr_output_state(outputs, target_monitor=999))
 
     def test_target_resolution_does_not_substitute_the_second_screen(self):
         from mimonitor_toolbox import windows
@@ -179,6 +179,146 @@ class WindowsRuntimeTests(unittest.TestCase):
         self.assertFalse(dispatch(0x0218, 0x0004, lambda: resume_events.append("suspend")))
         self.assertFalse(dispatch(0x001A, 0x0012, lambda: resume_events.append("other")))
         self.assertEqual(resume_events, ["automatic"])
+
+
+class _FakeEnumDisplayDevices:
+    """够用的 EnumDisplayDevicesW 替身：适配器枚举 + 按适配器枚举显示器。"""
+
+    def __init__(self, adapters, monitors):
+        self.argtypes = None
+        self.restype = None
+        self._adapters = adapters
+        self._monitors = monitors
+
+    def __call__(self, lpDevice, iDevNum, lpDisplayDevice, dwFlags):
+        device = lpDisplayDevice._obj
+        if lpDevice is None:
+            if iDevNum >= len(self._adapters):
+                return 0
+            name, string, flags = self._adapters[iDevNum]
+            device.DeviceName = name
+            device.DeviceString = string
+            device.StateFlags = flags
+            return 1
+        entries = self._monitors.get(str(lpDevice), [])
+        if iDevNum >= len(entries):
+            return 0
+        device_id, device_string = entries[iDevNum]
+        device.DeviceName = f"{lpDevice}\\Monitor{iDevNum}"
+        device.DeviceID = device_id
+        device.DeviceString = device_string
+        device.StateFlags = 0x1
+        return 1
+
+
+def _monitor_entry(code, uid, name="Generic PnP Monitor"):
+    return (rf"\\?\DISPLAY#{code}#5&mock&0&UID{uid}#{{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}}", name)
+
+
+class HdrTargetDetectionTests(unittest.TestCase):
+    """自动识别按 EDID 厂商码匹配：不能写死型号（2025 款 XMI27B3 / 2026 款 XMI3009）。"""
+
+    def _display(self, code, uid, name="Monitor"):
+        return {"device_name": rf"\\.\DISPLAY{uid}", "device_id": _monitor_entry(code, uid)[0],
+                "label": name}
+
+    def test_matches_both_2025_and_2026_product_codes(self):
+        from mimonitor_toolbox import windows
+
+        for code in ("XMI3009", "XMI27B3"):
+            with self.subTest(code=code):
+                displays = [self._display(code, 1), self._display("ZAKO99", 2)]
+                self.assertIs(windows.resolve_hdr_target_display(displays), displays[0])
+
+    def test_non_xiaomi_screens_are_not_matched(self):
+        from mimonitor_toolbox import windows
+
+        displays = [self._display("ZAKO99", 1), self._display("ACME01", 2)]
+        self.assertIsNone(windows.resolve_hdr_target_display(displays))
+
+    def test_two_xiaomi_screens_are_not_guessed(self):
+        from mimonitor_toolbox import windows
+
+        displays = [self._display("XMI3009", 1), self._display("XMI27B3", 2)]
+        self.assertIsNone(windows.resolve_hdr_target_display(displays))
+
+    def test_single_non_matching_screen_still_falls_back(self):
+        from mimonitor_toolbox import windows
+
+        displays = [self._display("ZAKO99", 1)]
+        self.assertIs(windows.resolve_hdr_target_display(displays), displays[0])
+
+    def test_manual_selection_wins(self):
+        from mimonitor_toolbox import windows
+
+        displays = [self._display("XMI3009", 1), self._display("ZAKO99", 2)]
+        self.assertIs(windows.resolve_hdr_target_display(displays, displays[1]["device_id"]),
+                      displays[1])
+        # 选定的屏不在了也不改用别的屏
+        self.assertIsNone(windows.resolve_hdr_target_display(displays, "missing"))
+
+    def test_product_code_parsing(self):
+        from mimonitor_toolbox import windows
+
+        self.assertEqual(windows.display_product_code(_monitor_entry("XMI3009", 1)[0]), "XMI3009")
+        self.assertEqual(windows.display_product_code(""), "")
+        self.assertEqual(windows.display_product_code(None), "")
+        self.assertEqual(windows.display_product_code(r"\\.\DISPLAY1"), "")
+
+    def test_list_windows_displays_labels_carry_the_product_code(self):
+        from mimonitor_toolbox import windows
+
+        fake = _FakeEnumDisplayDevices(
+            adapters=[(r"\\.\DISPLAY1", "Intel(R) UHD Graphics", 0x1),
+                      (r"\\.\DISPLAY2", "Zako Virtual Display", 0x0)],  # 未接入桌面，应跳过
+            monitors={
+                r"\\.\DISPLAY1": [_monitor_entry("XMI3009", 4352)],
+                r"\\.\DISPLAY2": [_monitor_entry("ZAKO99", 9999, "Zako Virtual Display")],
+            },
+        )
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows, "user32", mock.Mock(EnumDisplayDevicesW=fake)):
+            displays = windows.list_windows_displays()
+
+        self.assertEqual(len(displays), 1)
+        self.assertEqual(displays[0]["device_name"], r"\\.\DISPLAY1")
+        self.assertIn("XMI3009", displays[0]["device_id"])
+        # 占位名 "Generic PnP Monitor" 被丢掉，产品码才是能区分屏幕的那一段
+        self.assertEqual(displays[0]["label"], "XMI3009 · 屏幕 1")
+
+    def test_generic_monitor_names_are_dropped_from_labels(self):
+        from mimonitor_toolbox import windows
+
+        device_id = _monitor_entry("XMI3009", 4352)[0]
+        for generic in ("Generic PnP Monitor", "generic pnp monitor", "Default Monitor",
+                        "通用即插即用监视器", "显示器", "   ", None):
+            with self.subTest(name=generic):
+                self.assertEqual(windows._display_label(generic, device_id, "屏幕 1"),
+                                 "XMI3009 · 屏幕 1")
+        # 真名要留着
+        self.assertEqual(windows._display_label("G Pro 27U", device_id, "屏幕 1"),
+                         "G Pro 27U · XMI3009 · 屏幕 1")
+        # 产品码解析不到时也不能剩下空段
+        self.assertEqual(windows._display_label("Generic PnP Monitor", "", "屏幕 2"), "屏幕 2")
+
+    def test_two_monitors_on_one_adapter_get_distinct_slot_labels(self):
+        """一个适配器下挂多台 monitor 时槽位名不能重号（真机上出现过两条「屏幕 1」）。"""
+        from mimonitor_toolbox import windows
+
+        fake = _FakeEnumDisplayDevices(
+            adapters=[(r"\\.\DISPLAY1", "Intel(R) UHD Graphics", 0x1)],
+            monitors={r"\\.\DISPLAY1": [_monitor_entry("XMI3009", 4352),
+                                        _monitor_entry("ZAKO99", 9999, "Zako Virtual Display")]},
+        )
+        with mock.patch.object(windows.sys, "platform", "win32"), \
+                mock.patch.object(windows, "user32", mock.Mock(EnumDisplayDevicesW=fake)):
+            displays = windows.list_windows_displays()
+
+        self.assertEqual(len(displays), 2)
+        labels = [item["label"] for item in displays]
+        self.assertEqual(len(set(labels)), 2, labels)
+        self.assertEqual(labels[0], "XMI3009 · 屏幕 1")
+        self.assertEqual(labels[1], "Zako Virtual Display · ZAKO99 · 屏幕 1-2")
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from .presets import (
     unique_name,
 )
 from .widgets import LoadingSpinner, OverlayResizeFilter
-from .windows import list_windows_displays, query_windows_hdr_enabled, resolve_hdr_target_display
+from .windows import query_windows_hdr_enabled, resolve_hdr_target_display
 
 _preset_overlay_filter = None
 
@@ -59,7 +59,11 @@ class DisplayFeaturesMixin:
         self._hdr_last_state = None
         self._hdr_state_source = None
         self._hdr_windows_state = None
-        self._hdr_target_display_label = None
+        # 页面在 setup_ui 里就枚举过一次显示器并把结果缓存好了（本方法晚于它执行），
+        # 这里不能把缓存清掉 —— 否则要等用户展开一次下拉才有目标屏
+        self._hdr_target_display_label = getattr(self, "_hdr_target_display_label", None)
+        self._hdr_target_device_name = getattr(self, "_hdr_target_device_name", None)
+        self._hdr_target_displays = getattr(self, "_hdr_target_displays", None)
         self._hdr_memory_apply_timer = QTimer(self)
         self._hdr_memory_apply_timer.setSingleShot(True)
         self._hdr_memory_apply_timer.timeout.connect(self._apply_hdr_memory_for_current_state)
@@ -1352,15 +1356,26 @@ class DisplayFeaturesMixin:
     def _schedule_hdr_memory_check(self, reason="manual", delay_ms=500):
         QTimer.singleShot(delay_ms, lambda r=reason: self._poll_hdr_memory_state(r))
 
+    def _apply_hdr_target_resolution(self):
+        """按当前设置 + 最近一次枚举结果，算出"要读哪块屏、标签上显示什么"。
+
+        枚举只发生在建页面和展开下拉时（`pages._reload_hdr_target_displays`）；
+        这里只做解析，不碰 Win32 —— HDR 状态每 3 秒轮询一次，不能每次都去枚举。
+        """
+        displays = getattr(self, "_hdr_target_displays", None) or []
+        configured = load_settings().get("hdr_target_display_id", "") or ""
+        target = resolve_hdr_target_display(displays, configured)
+        self._hdr_target_display_label = target["label"] if target else None
+        self._hdr_target_device_name = target["device_name"] if target else None
+
     def _query_windows_hdr_state(self):
+        """查已解析好的那块屏的 HDR 状态；没有目标屏就直接返回 None。"""
+        device_name = getattr(self, "_hdr_target_device_name", None)
+        if not device_name:
+            return None
         try:
-            displays = list_windows_displays()
-            target = resolve_hdr_target_display(
-                displays, load_settings().get("hdr_target_display_id"))
-            self._hdr_target_display_label = target["label"] if target else None
-            return query_windows_hdr_enabled(target_device_id=target["device_id"]) if target else None
+            return query_windows_hdr_enabled(target_device_name=device_name)
         except Exception:
-            self._hdr_target_display_label = None
             return None
 
     def _select_hdr_target_display(self, index):
@@ -1368,6 +1383,9 @@ class DisplayFeaturesMixin:
         if not 0 <= index < len(ids):
             return
         update_settings({"hdr_target_display_id": ids[index]})
+        # 换目标屏：重算缓存并立刻刷新状态标签（不用等下一次轮询）
+        self._apply_hdr_target_resolution()
+        self._update_hdr_memory_status_label("切换目标显示器")
         self._hdr_last_state = None
         self._schedule_hdr_memory_check("切换目标显示器", delay_ms=80)
 
@@ -1484,7 +1502,15 @@ class DisplayFeaturesMixin:
             label.setTextColor(QColor(216, 59, 1), QColor(216, 59, 1))
         else:
             label.setTextColor(QColor(120, 120, 120), QColor(255, 255, 255, 140))
-        target = getattr(self, "_hdr_target_display_label", None) or "未找到目标显示器"
+        configured = load_settings().get("hdr_target_display_id") or ""
+        target = getattr(self, "_hdr_target_display_label", None)
+        if target:
+            # 手动选过就标「手动指定」，否则是自动识别挑的 —— 让用户知道凭什么读这块屏
+            target = f"{target}（{'手动指定' if configured else '自动识别'}）"
+        elif configured:
+            target = "已选定的显示器已断开"
+        else:
+            target = "未找到目标显示器"
         label.setText(
             f"目标屏：{target}；分区控光记忆：{prefix}，当前信号：{state_text}"
             f"{state_source_text}，记忆模式：SDR={sdr_text}，HDR={hdr_text}"

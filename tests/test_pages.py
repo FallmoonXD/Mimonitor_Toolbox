@@ -362,9 +362,84 @@ class CountdownSettingsUiTests(TrayTestBase):
         options = [window.hdr_target_combo.itemText(i)
                    for i in range(window.hdr_target_combo.count())]
         self.assertEqual(options[0], "自动识别")
-        self.assertTrue(all("（" not in text and "(" not in text for text in options))
         self.assertEqual(window.chk_hdr_local_dimming_memory.text(), "HDR/SDR 分区控光记忆")
         self.assertEqual(window.chk_freesync_mode_memory.text(), "FreeSync Pro 模式记忆")
+
+    def test_stale_target_display_shows_a_plain_disconnected_item(self):
+        """存过的目标屏枚举不到时补的那一项是我们自己的文案，不该带括号。
+
+        下拉里其余项是 Windows 给的设备名，可能自带括号 —— 那条不该被断言钉住。
+        """
+        from mimonitor_toolbox import pages as pages_module
+
+        settings = {"hdr_target_display_id": "gone"}
+        with mock.patch.object(pages_module, "load_settings",
+                               side_effect=lambda: dict(settings)):
+            window = self._app()
+        try:
+            options = [window.hdr_target_combo.itemText(i)
+                       for i in range(window.hdr_target_combo.count())]
+            self.assertIn("显示器已断开", options)
+            self.assertFalse(any("（" in text or "(" in text for text in options))
+        finally:
+            self._close(window)
+
+    def test_opening_the_dropdown_re_enumerates_displays(self):
+        """展开下拉要重新枚举：显示器是运行期会变的，不能只在建页面时枚举一次。"""
+        from mimonitor_toolbox import pages as pages_module
+
+        first = [{"device_name": r"\\.\DISPLAY1", "device_id": "ID1",
+                  "label": "XMI3009 · 屏幕 1"}]
+        second = first + [{"device_name": r"\\.\DISPLAY2", "device_id": "ID2",
+                           "label": "ZAKO99 · 屏幕 2"}]
+        with mock.patch.object(pages_module, "list_windows_displays", return_value=first):
+            window = self._app()
+        try:
+            combo = window.hdr_target_combo
+            self.assertEqual(combo.count(), 2)          # 建页面时枚举到的
+            with mock.patch.object(pages_module, "list_windows_displays",
+                                   return_value=second):
+                window._reload_hdr_target_displays()    # 展开下拉前走的就是它
+            self.assertEqual(combo.count(), 3)
+            self.assertEqual(combo.itemText(2), "ZAKO99 · 屏幕 2")
+            self.assertEqual(combo.currentIndex(), 0)   # 刷新不能把用户的选择弄丢
+        finally:
+            self._close(window)
+
+    def test_refreshable_combo_runs_the_callback_before_showing_the_menu(self):
+        from qfluentwidgets import ComboBox
+
+        from mimonitor_toolbox.widgets import RefreshableComboBox
+
+        combo = RefreshableComboBox()
+        combo.addItem("自动识别")
+        calls = []
+        combo.setBeforePopup(lambda: calls.append("refresh"))
+        with mock.patch.object(ComboBox, "_showComboMenu") as base:
+            combo._showComboMenu()
+        self.assertEqual(calls, ["refresh"])
+        base.assert_called_once()
+
+    def test_hdr_source_tooltip_describes_vendor_matching_without_a_year(self):
+        """文案不该出现年份/机型：软件是给 2026 用的，识别依据只是 EDID 厂商码。"""
+        tooltip = self.window.hdr_target_combo.toolTip()
+        self.assertIn("XMI", tooltip)
+        self.assertNotIn("2025", tooltip)
+        self.assertNotIn("G Pro", tooltip)
+
+    def test_display_enumeration_failure_does_not_break_the_page(self):
+        """枚举显示器是 Win32 调用：抛异常也不该带走整个设置页（之前没有兜底）。"""
+        from mimonitor_toolbox import pages as pages_module
+
+        with mock.patch.object(pages_module, "list_windows_displays",
+                               side_effect=OSError("enum boom")):
+            window = self._app()
+        try:
+            combo = window.hdr_target_combo
+            self.assertEqual([combo.itemText(i) for i in range(combo.count())], ["自动识别"])
+            self.assertGreaterEqual(combo.width(), 300)
+        finally:
+            self._close(window)
 
 
 class TrayMenuTests(TrayTestBase):

@@ -9,7 +9,7 @@ import sys
 import time
 
 from PyQt6.QtCore import QSize, QTime, Qt, QTimer
-from PyQt6.QtGui import QColor, QIcon
+from PyQt6.QtGui import QColor, QFontMetrics, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -69,6 +69,7 @@ from .widgets import (
     PageScrollSlider,
     PresetCard,
     PresetNameDialog,
+    RefreshableComboBox,
     TrayItemList,
 )
 
@@ -817,6 +818,63 @@ class PagesMixin:
             checkbox.setEnabled(not suspended)
             checkbox.setToolTip(MEMORY_TAKEOVER_HINT)
 
+    def _reload_hdr_target_displays(self):
+        """重新枚举显示器并重建「HDR 状态来源」下拉。
+
+        建页面时调一次，之后每次**展开下拉前**再调一次 —— 显示器是运行期会变的
+        （中途插拔、开机后才接上），不重来一遍用户就得重启才能选到它。
+        重建时屏蔽信号：程序化改 currentIndex 不能被当成"用户选了别的屏"。
+        """
+        combo = getattr(self, "hdr_target_combo", None)
+        if combo is None:
+            return
+        try:
+            displays = list_windows_displays()
+        except Exception as error:
+            # 枚举是 Win32 调用：失败只让步手动指定，不能带走设置页，也不能清掉已有选择
+            self.log(f"枚举显示器失败，目标屏只能手动指定：{error}")
+            displays = []
+        configured = load_settings().get("hdr_target_display_id", "") or ""
+        ids = [""]
+        labels = ["自动识别"]
+        for display in displays:
+            ids.append(display["device_id"])
+            labels.append(display["label"])
+        if configured and configured not in ids:
+            ids.append(configured)
+            labels.append("显示器已断开")
+
+        previous_ids = getattr(self, "_hdr_target_display_ids", [""])
+        index = combo.currentIndex()
+        selected = previous_ids[index] if 0 <= index < len(previous_ids) else ""
+        if selected not in ids:
+            selected = configured if configured in ids else ""
+
+        blocked = combo.blockSignals(True)
+        try:
+            combo.clear()
+            for label in labels:
+                combo.addItem(label)
+            self._hdr_target_display_ids = ids
+            combo.setCurrentIndex(ids.index(selected))
+        finally:
+            combo.blockSignals(blocked)
+        self._fit_hdr_target_combo_width()
+        # 枚举结果同时用来解析"要读哪块屏"，HDR 轮询直接用这份缓存，不再自己枚举
+        self._hdr_target_displays = displays
+        self._apply_hdr_target_resolution()
+        self._update_hdr_memory_status_label()
+
+    def _fit_hdr_target_combo_width(self):
+        """按最长一项定宽：写死 300 装不下 "XMI3009 · 屏幕 1" 这类文案。"""
+        combo = getattr(self, "hdr_target_combo", None)
+        if combo is None:
+            return
+        metrics = QFontMetrics(combo.font())
+        widest = max((metrics.horizontalAdvance(combo.itemText(i))
+                      for i in range(combo.count())), default=0)
+        combo.setFixedWidth(min(420, max(300, widest + 48)))
+
     def _preset_apply(self, preset_id):
         self.apply_preset_by_id(preset_id)
         # 应用后状态落盘，卡片上的「已应用」和画面页提示都要跟着变
@@ -1329,22 +1387,14 @@ class PagesMixin:
         hdr_target_layout = QHBoxLayout()
         hdr_target_layout.setSpacing(15)
         hdr_target_layout.addWidget(BodyLabel("HDR 状态来源", card3))
-        self.hdr_target_combo = ComboBox(card3)
-        self.hdr_target_combo.setFixedWidth(300)
-        self.hdr_target_combo.addItem("自动识别")
+        self.hdr_target_combo = RefreshableComboBox(card3)
         self.hdr_target_combo.setToolTip(
-            "单屏时使用当前显示器；多屏时自动识别 G Pro 27U 2025。也可以手动指定。")
+            "未选定时按 EDID 厂商码（XMI）自动识别小米系显示器；"
+            "识别不到或识别错的请手动指定。")
         self._hdr_target_display_ids = [""]
-        for display in list_windows_displays():
-            self.hdr_target_combo.addItem(display["label"])
-            self._hdr_target_display_ids.append(display["device_id"])
-        configured_target = settings.get("hdr_target_display_id", "")
-        if configured_target and configured_target not in self._hdr_target_display_ids:
-            self.hdr_target_combo.addItem("显示器已断开")
-            self._hdr_target_display_ids.append(configured_target)
-        if configured_target in self._hdr_target_display_ids:
-            self.hdr_target_combo.setCurrentIndex(
-                self._hdr_target_display_ids.index(configured_target))
+        # 建页面时枚举一次；之后每次展开下拉再重新枚举（中途插拔不用重启）
+        self._reload_hdr_target_displays()
+        self.hdr_target_combo.setBeforePopup(self._reload_hdr_target_displays)
         self.hdr_target_combo.currentIndexChanged.connect(self._select_hdr_target_display)
         hdr_target_layout.addWidget(self.hdr_target_combo)
         hdr_target_layout.addStretch()

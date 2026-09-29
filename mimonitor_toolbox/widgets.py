@@ -74,6 +74,28 @@ from qfluentwidgets.common import getFont
 
 from .windows import user32
 
+
+class RefreshableComboBox(ComboBox):
+    """展开下拉前先跑一次刷新回调。
+
+    显示器列表会变（插拔、开机后才接上），而 qfluentwidgets 的 ComboBox 只在
+    `addItem` 时记下条目、展开时才构建菜单，所以这里在真正弹菜单之前给调用方
+    一次重建列表的机会 —— 否则用户得重启程序才能选到新接上的屏。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self._before_popup = None
+
+    def setBeforePopup(self, callback):
+        self._before_popup = callback
+
+    def _showComboMenu(self):
+        if self._before_popup is not None:
+            self._before_popup()
+        super()._showComboMenu()
+
+
 class OverlayResizeFilter(QObject):
     """让遮罩跟随宿主尺寸。
 

@@ -31,17 +31,18 @@ class DisplayFeatureTests(unittest.TestCase):
         from mimonitor_toolbox.display_features import DisplayFeaturesMixin
 
         host = DisplayFeaturesMixin()
-        displays = [
+        host._hdr_target_displays = [
             {"device_name": "DISPLAY1", "device_id": "XMI27B3-1", "label": "红米"},
             {"device_name": "DISPLAY2", "device_id": "VIRTUAL-2", "label": "虚拟屏"},
         ]
         with mock.patch.object(display_features, "load_settings",
                                return_value={"hdr_target_display_id": "XMI27B3-1"}), \
-                mock.patch.object(display_features, "list_windows_displays", return_value=displays), \
                 mock.patch.object(display_features, "query_windows_hdr_enabled",
                                   return_value=False) as query:
+            host._apply_hdr_target_resolution()
             self.assertFalse(host._query_windows_hdr_state())
-        query.assert_called_once_with(target_device_id="XMI27B3-1")
+        # 查询只带 GDI 名字，不再自己去枚举/解析显示器
+        query.assert_called_once_with(target_device_name="DISPLAY1")
         self.assertEqual(host._hdr_target_display_label, "红米")
 
     def test_missing_hdr_target_does_not_use_other_display(self):
@@ -49,14 +50,29 @@ class DisplayFeatureTests(unittest.TestCase):
         from mimonitor_toolbox.display_features import DisplayFeaturesMixin
 
         host = DisplayFeaturesMixin()
-        displays = [{"device_name": "DISPLAY2", "device_id": "VIRTUAL-2",
-                     "label": "虚拟屏"}]
+        host._hdr_target_displays = [
+            {"device_name": "DISPLAY2", "device_id": "VIRTUAL-2", "label": "虚拟屏"},
+        ]
         with mock.patch.object(display_features, "load_settings",
                                return_value={"hdr_target_display_id": "missing"}), \
-                mock.patch.object(display_features, "list_windows_displays", return_value=displays), \
                 mock.patch.object(display_features, "query_windows_hdr_enabled") as query:
+            host._apply_hdr_target_resolution()
             self.assertIsNone(host._query_windows_hdr_state())
         query.assert_not_called()
+        self.assertIsNone(host._hdr_target_device_name)
+
+    def test_hdr_state_query_never_enumerates_displays(self):
+        """轮询每 3 秒一次，绝不能顺手去枚举显示器。"""
+        from mimonitor_toolbox import display_features
+        from mimonitor_toolbox.display_features import DisplayFeaturesMixin
+
+        host = DisplayFeaturesMixin()
+        host._hdr_target_device_name = "DISPLAY1"
+        with mock.patch.object(display_features, "query_windows_hdr_enabled",
+                               return_value=True) as query:
+            self.assertTrue(host._query_windows_hdr_state())
+        query.assert_called_once_with(target_device_name="DISPLAY1")
+        self.assertFalse(hasattr(display_features, "list_windows_displays"))
 
 
 class CrosshairModeReconcileTests(unittest.TestCase):
